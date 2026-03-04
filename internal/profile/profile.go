@@ -35,8 +35,8 @@ func builtinScootUI() (*Profile, error) {
 	}
 
 	return &Profile{
-		Binary: "/usr/bin/flutter-drm-gbm-backend",
-		Args:   []string{"flutter-drm-gbm-backend", "-b", bundlePath},
+		Binary: "/usr/bin/flutter-fbdev-backend",
+		Args:   []string{"flutter-fbdev-backend", "-b", bundlePath},
 		Dir:    bundlePath,
 	}, nil
 }
