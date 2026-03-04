@@ -28,15 +28,23 @@ func discoverFlutterPath() (string, error) {
 	return matches[0], nil
 }
 
+func discoverFlutterBackend() (string, string) {
+	if _, err := os.Stat("/usr/bin/flutter-fbdev-backend"); err == nil {
+		return "/usr/bin/flutter-fbdev-backend", "flutter-fbdev-backend"
+	}
+	return "/usr/bin/flutter-drm-gbm-backend", "flutter-drm-gbm-backend"
+}
+
 func builtinScootUI() (*Profile, error) {
 	bundlePath, err := discoverFlutterPath()
 	if err != nil {
 		return nil, err
 	}
 
+	binary, argv0 := discoverFlutterBackend()
 	return &Profile{
-		Binary: "/usr/bin/flutter-drm-gbm-backend",
-		Args:   []string{"flutter-drm-gbm-backend", "-b", bundlePath},
+		Binary: binary,
+		Args:   []string{argv0, "-b", bundlePath},
 		Dir:    bundlePath,
 	}, nil
 }

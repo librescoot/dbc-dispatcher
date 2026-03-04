@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	osexec "os/exec"
 	"syscall"
 	"time"
 
@@ -71,6 +72,12 @@ func main() {
 		if err := os.Chdir(p.Dir); err != nil {
 			log.Printf("warning: chdir %s: %v", p.Dir, err)
 		}
+	}
+
+	// Signal boot-animation to start fading before we exec the UI app.
+	// Non-blocking: fade runs concurrently with the app's initialization.
+	if err := osexec.Command("systemctl", "kill", "boot-animation.service").Run(); err != nil {
+		log.Printf("boot-animation stop: %v", err)
 	}
 
 	log.Printf("exec %s %v", p.Binary, p.Args)
