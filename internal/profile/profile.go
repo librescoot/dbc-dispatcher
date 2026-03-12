@@ -49,8 +49,26 @@ func builtinScootUI() (*Profile, error) {
 	}, nil
 }
 
+func builtinScootUIQt() (*Profile, error) {
+	const binary = "/usr/bin/scootui-qt"
+	if _, err := os.Stat(binary); err != nil {
+		return nil, fmt.Errorf("scootui-qt binary not found: %w", err)
+	}
+	return &Profile{
+		Binary: binary,
+		Args:   []string{"scootui-qt"},
+		Env: []string{
+			"QT_QPA_PLATFORM=eglfs",
+			"QT_QPA_EGLFS_INTEGRATION=eglfs_kms",
+			"QT_QPA_EGLFS_KMS_CONFIG=/etc/scootui-qt-kms.json",
+			"QT_PLUGIN_PATH=/usr/plugins:/usr/lib/plugins",
+		},
+	}, nil
+}
+
 var builtins = map[string]func() (*Profile, error){
-	"scootui": builtinScootUI,
+	"scootui":    builtinScootUI,
+	"scootui-qt": builtinScootUIQt,
 }
 
 // Resolve resolves an app name to a Profile. It checks, in order:
