@@ -61,7 +61,15 @@ func main() {
 
 	currentUnit := unitName(appName)
 	if err := startUnit(ctx, conn, currentUnit); err != nil {
-		log.Fatalf("failed to start %s: %v", currentUnit, err)
+		fallback := unitName(defaultApp)
+		if fallback == currentUnit {
+			log.Fatalf("failed to start %s: %v", currentUnit, err)
+		}
+		log.Printf("failed to start %s: %v, falling back to %s", currentUnit, err, fallback)
+		currentUnit = fallback
+		if err := startUnit(ctx, conn, currentUnit); err != nil {
+			log.Fatalf("failed to start fallback %s: %v", currentUnit, err)
+		}
 	}
 
 	// Subscribe to settings changes and watch for app switches
