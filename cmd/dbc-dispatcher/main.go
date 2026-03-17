@@ -18,7 +18,7 @@ import (
 var version = "dev"
 
 const (
-	defaultApp    = "scootui"
+	defaultApp    = "scootui-qt"
 	redisKey      = "settings"
 	redisField    = "dashboard.app"
 	retryInterval = 500 * time.Millisecond
