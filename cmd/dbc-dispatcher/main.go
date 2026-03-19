@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -18,11 +19,12 @@ import (
 var version = "dev"
 
 const (
-	defaultApp    = "scootui-qt"
-	redisKey      = "settings"
-	redisField    = "dashboard.app"
-	retryInterval = 500 * time.Millisecond
-	unitSuffix    = ".service"
+	defaultApp     = "scootui-qt"
+	redisKey       = "settings"
+	redisField     = "dashboard.app"
+	commandChannel = "dbc:command"
+	retryInterval  = 500 * time.Millisecond
+	unitSuffix     = ".service"
 )
 
 func main() {
@@ -73,10 +75,12 @@ func main() {
 	}
 
 	// Subscribe to settings changes and watch for app switches
-	pubsub := rdb.Subscribe(ctx, redisField)
+	pubsub := rdb.Subscribe(ctx, redisField, commandChannel)
 	defer pubsub.Close()
 
-	log.Printf("watching for %s changes", redisField)
+	log.Printf("watching %s and %s channels", redisField, commandChannel)
+
+	shuttingDown := false
 
 	for {
 		select {
@@ -88,6 +92,11 @@ func main() {
 			return
 
 		case msg := <-pubsub.Channel():
+			if msg.Channel == commandChannel {
+				handleCommand(ctx, conn, strings.TrimSpace(msg.Payload), currentUnit, &shuttingDown)
+				continue
+			}
+
 			newApp := strings.TrimSpace(msg.Payload)
 			if newApp == "" {
 				newApp = defaultApp
@@ -195,4 +204,30 @@ func readSetting(ctx context.Context, rdb *redis.Client) string {
 		return defaultApp
 	}
 	return val
+}
+
+func handleCommand(ctx context.Context, conn *dbus.Conn, command string, currentUnit string, shuttingDown *bool) {
+	switch command {
+	case "poweroff":
+		if *shuttingDown {
+			log.Printf("poweroff already in progress, ignoring")
+			return
+		}
+		*shuttingDown = true
+		log.Printf("received poweroff command, stopping %s", currentUnit)
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		stopUnit(stopCtx, conn, currentUnit)
+		stopCancel()
+		execPoweroff()
+	default:
+		log.Printf("unknown command: %q", command)
+	}
+}
+
+func execPoweroff() {
+	log.Printf("executing poweroff")
+	cmd := exec.Command("poweroff")
+	if err := cmd.Run(); err != nil {
+		log.Printf("poweroff failed: %v", err)
+	}
 }
