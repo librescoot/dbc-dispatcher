@@ -38,18 +38,19 @@ If Redis is unreachable after the timeout, the dispatcher continues anyway and u
 | Operation | Key/Channel | Field | Description |
 |---|---|---|---|
 | `HGET` | `settings` | `dashboard.app` | App name (read at startup) |
-| `SUBSCRIBE` | `dashboard.app` | — | App switch notifications |
+| `SUBSCRIBE` | `settings` | — | Watches for setting changes (filters for `dashboard.app` payload) |
 | `SUBSCRIBE` | `dbc:command` | — | Commands (`poweroff`) |
 
 The app name maps directly to a systemd unit: `scootui-qt` -> `scootui-qt.service`. Default is `scootui-qt`.
 
 ## App switching
 
-Publishing to the `dashboard.app` channel triggers a live switch:
+Change the app via the settings hash (same as `lsc settings set dashboard.app`):
 
 ```sh
-redis-cli publish dashboard.app carplay
-# stops scootui-qt.service, starts carplay.service
+redis-cli hset settings dashboard.app carplay
+redis-cli publish settings dashboard.app
+# dispatcher re-reads the value, stops scootui-qt.service, starts carplay.service
 ```
 
 If the new unit fails to start, the dispatcher reverts to the previous one.

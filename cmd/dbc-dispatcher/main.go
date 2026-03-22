@@ -19,12 +19,13 @@ import (
 var version = "dev"
 
 const (
-	defaultApp     = "scootui-qt"
-	redisKey       = "settings"
-	redisField     = "dashboard.app"
-	commandChannel = "dbc:command"
-	retryInterval  = 500 * time.Millisecond
-	unitSuffix     = ".service"
+	defaultApp      = "scootui-qt"
+	redisKey        = "settings"
+	redisField      = "dashboard.app"
+	settingsChannel = "settings"
+	commandChannel  = "dbc:command"
+	retryInterval   = 500 * time.Millisecond
+	unitSuffix      = ".service"
 )
 
 func main() {
@@ -74,11 +75,11 @@ func main() {
 		}
 	}
 
-	// Subscribe to settings changes and watch for app switches
-	pubsub := rdb.Subscribe(ctx, redisField, commandChannel)
+	// Subscribe to settings changes and DBC commands
+	pubsub := rdb.Subscribe(ctx, settingsChannel, commandChannel)
 	defer pubsub.Close()
 
-	log.Printf("watching %s and %s channels", redisField, commandChannel)
+	log.Printf("watching %s and %s channels", settingsChannel, commandChannel)
 
 	shuttingDown := false
 
@@ -97,10 +98,14 @@ func main() {
 				continue
 			}
 
-			newApp := strings.TrimSpace(msg.Payload)
-			if newApp == "" {
-				newApp = defaultApp
+			// Settings channel: payload is the field name that changed
+			if strings.TrimSpace(msg.Payload) != redisField {
+				continue
 			}
+
+			// Re-read the actual value from the hash
+			newApp := readSetting(ctx, rdb)
+			log.Printf("setting %s changed, new value: %q", redisField, newApp)
 			newUnit := unitName(newApp)
 			if newUnit == currentUnit {
 				continue
