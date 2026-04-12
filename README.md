@@ -2,50 +2,55 @@
 
 Manages display applications on the Dashboard Computer (DBC) as systemd units. Reads the configured app from Redis, starts it via D-Bus, and watches for live app switches and power commands.
 
+Written in C for fast startup on the i.MX6 DL (ARMv7). Statically linked, no runtime dependencies.
+
 ## How it works
 
 1. Connect to Redis and systemd D-Bus
 2. Read `HGET settings dashboard.app` for the app name
 3. Start `<app>.service` via D-Bus (falls back to `scootui-qt` on failure)
-4. Subscribe to Redis PUBSUB on `dashboard.app` and `dbc:command`
+4. Subscribe to Redis PUBSUB on `settings` and `dbc:command`
 5. On app change: stop current unit, start new one (reverts on failure)
 6. On `poweroff` command: stop current unit, run `poweroff`
 
-The dispatcher stays running for the lifetime of the DBC session — it doesn't exec into the target app.
+The dispatcher stays running for the lifetime of the DBC session.
 
 ## Build
 
+Requires `libsystemd-dev` and `libhiredis-dev`. For cross-compilation, install the `armhf` variants plus `gcc-arm-linux-gnueabihf`.
+
 ```sh
-# ARM target (production, armv7)
+# ARM target (production, armv7 static binary)
 make build
 
-# Host platform (development)
+# Host platform (development, dynamically linked)
 make build-host
+
+# Stripped ARM binary for distribution
+make dist
 ```
 
 ## Flags
 
-| Flag | Default | Description |
-|---|---|---|
-| `--redis-url` | `redis://192.168.7.1:6379` | Redis server URL |
-| `--timeout` | `5s` | Redis connection timeout |
-| `--version` | — | Print version and exit |
+| Flag | Description |
+|---|---|
+| `--version` | Print version and exit |
 
-If Redis is unreachable after the timeout, the dispatcher continues anyway and uses the default app.
+Redis host (`192.168.7.1:6379`) and timeout (5s) are compiled in. If Redis is unreachable after the timeout, the dispatcher continues with the default app.
 
 ## Redis API
 
 | Operation | Key/Channel | Field | Description |
 |---|---|---|---|
 | `HGET` | `settings` | `dashboard.app` | App name (read at startup) |
-| `SUBSCRIBE` | `settings` | — | Watches for setting changes (filters for `dashboard.app` payload) |
-| `SUBSCRIBE` | `dbc:command` | — | Commands (`poweroff`) |
+| `SUBSCRIBE` | `settings` | -- | Watches for setting changes (filters for `dashboard.app` payload) |
+| `SUBSCRIBE` | `dbc:command` | -- | Commands (`poweroff`) |
 
 The app name maps directly to a systemd unit: `scootui-qt` -> `scootui-qt.service`. Default is `scootui-qt`.
 
 ## App switching
 
-Change the app via the settings hash (same as `lsc settings set dashboard.app`):
+Change the app via the settings hash:
 
 ```sh
 redis-cli hset settings dashboard.app carplay

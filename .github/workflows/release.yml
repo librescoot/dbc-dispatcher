@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install cross-compilation toolchain
+        run: |
+          sudo dpkg --add-architecture armhf
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf \
+            libsystemd-dev:armhf libhiredis-dev:armhf
+
+      - name: Build armv7 binary
+        run: make dist
+
+      - name: Stage release artifact
+        id: stage
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          STAGED="dbc-dispatcher-${VERSION}-linux-armv7"
+          cp bin/dbc-dispatcher "${STAGED}"
+          sha256sum "${STAGED}" > "${STAGED}.sha256"
+          echo "artifact=${STAGED}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2.4.2
+        with:
+          name: "dbc-dispatcher ${{ github.ref_name }}"
+          files: |
+            ${{ steps.stage.outputs.artifact }}
+            ${{ steps.stage.outputs.artifact }}.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
