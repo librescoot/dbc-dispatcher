@@ -274,11 +274,23 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Connect to systemd D-Bus */
+    /* Connect directly to systemd's private bus (no D-Bus daemon needed) */
     sd_bus *bus = NULL;
-    int r = sd_bus_open_system(&bus);
+    int r = sd_bus_new(&bus);
     if (r < 0) {
-        log_msg("failed to connect to systemd D-Bus: %s", strerror(-r));
+        log_msg("failed to create bus: %s", strerror(-r));
+        return 1;
+    }
+    r = sd_bus_set_address(bus, "unix:path=/run/systemd/private");
+    if (r < 0) {
+        log_msg("failed to set bus address: %s", strerror(-r));
+        sd_bus_unref(bus);
+        return 1;
+    }
+    r = sd_bus_start(bus);
+    if (r < 0) {
+        log_msg("failed to connect to systemd: %s", strerror(-r));
+        sd_bus_unref(bus);
         return 1;
     }
 
