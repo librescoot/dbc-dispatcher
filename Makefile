@@ -7,14 +7,14 @@ CROSS_CC := arm-linux-gnueabihf-gcc
 HOST_CC := gcc
 
 CFLAGS := -Wall -Wextra -Os -DVERSION=\"$(VERSION)\"
-CROSS_PKG_CONFIG := arm-linux-gnueabihf-pkg-config
-HOST_PKG_CONFIG := pkg-config
+PKG_CONFIG := pkg-config
+CROSS_PKG_CONFIG_ENV := PKG_CONFIG_LIBDIR=/usr/lib/arm-linux-gnueabihf/pkgconfig
 
-CROSS_CFLAGS := $(CFLAGS) $(shell $(CROSS_PKG_CONFIG) --cflags libsystemd hiredis 2>/dev/null)
-CROSS_LDFLAGS := -static $(shell $(CROSS_PKG_CONFIG) --libs --static libsystemd hiredis 2>/dev/null)
+CROSS_CFLAGS := $(CFLAGS) $(shell $(CROSS_PKG_CONFIG_ENV) $(PKG_CONFIG) --cflags libsystemd hiredis 2>/dev/null)
+CROSS_LDFLAGS := $(shell $(CROSS_PKG_CONFIG_ENV) $(PKG_CONFIG) --libs libsystemd hiredis 2>/dev/null)
 
-HOST_CFLAGS := $(CFLAGS) $(shell $(HOST_PKG_CONFIG) --cflags libsystemd hiredis 2>/dev/null)
-HOST_LDFLAGS := $(shell $(HOST_PKG_CONFIG) --libs libsystemd hiredis 2>/dev/null)
+HOST_CFLAGS := $(CFLAGS) $(shell $(PKG_CONFIG) --cflags libsystemd hiredis 2>/dev/null)
+HOST_LDFLAGS := $(shell $(PKG_CONFIG) --libs libsystemd hiredis 2>/dev/null)
 
 .PHONY: build build-host build-arm dist clean
 
