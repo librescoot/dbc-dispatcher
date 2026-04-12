@@ -20,6 +20,17 @@ jobs:
       - name: Install cross-compilation toolchain
         run: |
           sudo dpkg --add-architecture armhf
+          # Add Ubuntu ports mirror for armhf packages
+          sudo tee /etc/apt/sources.list.d/ubuntu-ports.sources > /dev/null <<PORTS
+          Types: deb
+          URIs: http://ports.ubuntu.com/ubuntu-ports/
+          Suites: $(lsb_release -cs) $(lsb_release -cs)-updates
+          Components: main universe
+          Architectures: armhf
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          PORTS
+          # Restrict existing sources to amd64
+          sudo sed -i '/^Components:/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
           sudo apt-get update
           sudo apt-get install -y gcc-arm-linux-gnueabihf \
             libsystemd-dev:armhf libhiredis-dev:armhf
