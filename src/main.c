@@ -62,24 +62,20 @@ static void unit_name(const char *app, char *buf, size_t bufsz) {
 static int wait_for_job(sd_bus *bus, const char *job_path, const char *unit,
                         const char *action) {
     int r;
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += STOP_TIMEOUT_US / 1000000;
 
-    /* Add a match for JobRemoved signals */
-    char match[512];
-    snprintf(match, sizeof(match),
-             "type='signal',"
-             "sender='org.freedesktop.systemd1',"
-             "interface='org.freedesktop.systemd1.Manager',"
-             "member='JobRemoved',"
-             "path='/org/freedesktop/systemd1'");
-
-    r = sd_bus_add_match(bus, NULL, match, NULL, NULL);
-    if (r < 0) {
-        log_msg("%s %s: failed to add match: %s", action, unit, strerror(-r));
-        return r;
-    }
-
-    /* Process bus messages until we see our job complete */
+    /* Process bus messages until we see our job complete or timeout */
     for (;;) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec > deadline.tv_sec ||
+            (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
+            log_msg("%s %s: timed out waiting for job", action, unit);
+            return -1;
+        }
+
         sd_bus_message *msg = NULL;
         r = sd_bus_process(bus, &msg);
         if (r < 0) {
@@ -107,7 +103,11 @@ static int wait_for_job(sd_bus *bus, const char *job_path, const char *unit,
             continue;
         }
 
-        r = sd_bus_wait(bus, STOP_TIMEOUT_US);
+        uint64_t remaining_us = (deadline.tv_sec - now.tv_sec) * 1000000 +
+                                (deadline.tv_nsec - now.tv_nsec) / 1000;
+        if (remaining_us > STOP_TIMEOUT_US)
+            remaining_us = STOP_TIMEOUT_US;
+        r = sd_bus_wait(bus, remaining_us);
         if (r < 0) {
             log_msg("%s %s: bus wait error: %s", action, unit, strerror(-r));
             return r;
@@ -282,16 +282,19 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Subscribe to JobRemoved signals before starting anything */
-    char match_rule[] =
+    /* Subscribe to JobRemoved signals for start/stop job tracking */
+    r = sd_bus_add_match(bus, NULL,
         "type='signal',"
         "sender='org.freedesktop.systemd1',"
         "interface='org.freedesktop.systemd1.Manager',"
         "member='JobRemoved',"
-        "path='/org/freedesktop/systemd1'";
-    r = sd_bus_add_match(bus, NULL, match_rule, NULL, NULL);
-    if (r < 0)
-        log_msg("warning: failed to subscribe to JobRemoved: %s", strerror(-r));
+        "path='/org/freedesktop/systemd1'",
+        NULL, NULL);
+    if (r < 0) {
+        log_msg("failed to subscribe to JobRemoved: %s", strerror(-r));
+        sd_bus_unref(bus);
+        return 1;
+    }
 
     /* Connect to Redis */
     redisContext *rctx = connect_redis();
@@ -382,8 +385,8 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Check for Redis messages */
-        if (nfds > 1 && (fds[1].revents & POLLIN)) {
+        /* Check for Redis messages or connection errors */
+        if (nfds > 1 && (fds[1].revents & (POLLIN | POLLHUP | POLLERR))) {
             redisReply *reply = NULL;
             if (redisGetReply(sub_ctx, (void **)&reply) != REDIS_OK || !reply) {
                 log_msg("redis subscription lost, reconnecting...");
@@ -412,10 +415,14 @@ int main(int argc, char **argv) {
             }
 
             if (reply->type == REDIS_REPLY_ARRAY && reply->elements >= 3 &&
+                reply->element[0]->str &&
+                reply->element[1]->str &&
+                reply->element[2]->str &&
                 strcmp(reply->element[0]->str, "message") == 0) {
 
                 const char *channel = reply->element[1]->str;
-                char *payload = strip(strdup(reply->element[2]->str));
+                char *payload_raw = strdup(reply->element[2]->str);
+                char *payload = strip(payload_raw);
 
                 if (strcmp(channel, COMMAND_CHANNEL) == 0) {
                     if (strcmp(payload, "poweroff") == 0) {
@@ -424,7 +431,10 @@ int main(int argc, char **argv) {
                             log_msg("received poweroff command, stopping %s",
                                     current_unit);
                             stop_unit(bus, current_unit);
+                            free(payload_raw);
+                            freeReplyObject(reply);
                             do_poweroff();
+                            goto done;
                         } else {
                             log_msg("poweroff already in progress, ignoring");
                         }
@@ -458,13 +468,14 @@ int main(int argc, char **argv) {
                     }
                 }
 
-                free(payload);
+                free(payload_raw);
             }
 
             freeReplyObject(reply);
         }
     }
 
+done:
     close(sfd);
     sd_bus_unref(bus);
     if (rctx) redisFree(rctx);
