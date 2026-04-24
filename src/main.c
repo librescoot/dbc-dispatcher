@@ -440,11 +440,15 @@ int main(int argc, char **argv) {
                     if (strcmp(payload, "poweroff") == 0) {
                         if (!shutting_down) {
                             shutting_down = true;
-                            log_msg("received poweroff command, stopping %s",
-                                    current_unit);
-                            stop_unit(bus, current_unit);
+                            log_msg("received poweroff command, executing poweroff");
                             free(payload_raw);
                             freeReplyObject(reply);
+                            /* Don't serialize on stopping the display unit first
+                             * — shutdown.target will SIGTERM it in parallel with
+                             * everything else. VBUS is cut 5s after the vehicle
+                             * FSM enters ShuttingDown, so we want to burn as
+                             * little of that budget as possible before handing
+                             * off to systemd. */
                             do_poweroff();
                             goto done;
                         } else {
