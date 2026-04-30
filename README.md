@@ -2,6 +2,8 @@
 
 Manages display applications on the Dashboard Computer (DBC) as systemd units. Reads the configured app from Redis, starts it via D-Bus, and watches for live app switches and power commands.
 
+Part of the [Librescoot](https://librescoot.org/) open-source platform.
+
 Written in C for fast startup on the i.MX6 DL (ARMv7). Statically linked, no runtime dependencies.
 
 ## How it works
@@ -59,3 +61,14 @@ redis-cli publish settings dashboard.app
 ```
 
 If the new unit fails to start, the dispatcher reverts to the previous one.
+
+## License
+
+This project is dual-licensed. The source code is available under the
+[Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License][cc-by-nc-sa].
+The maintainers reserve the right to grant separate licenses for commercial distribution; please contact the maintainers to discuss commercial licensing.
+
+[![CC BY-NC-SA 4.0][cc-by-nc-sa-image]][cc-by-nc-sa]
+
+[cc-by-nc-sa]: http://creativecommons.org/licenses/by-nc-sa/4.0/
+[cc-by-nc-sa-image]: https://licensebuttons.net/l/by-nc-sa/4.0/88x31.png
