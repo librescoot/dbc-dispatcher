@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/signalfd.h>
+#include <sys/stat.h>
 #include <systemd/sd-bus.h>
 #include <time.h>
 #include <unistd.h>
@@ -25,9 +26,9 @@
 #define SETTINGS_CHANNEL "settings"
 #define COMMAND_CHANNEL  "dbc:command"
 #define UNIT_SUFFIX      ".service"
-#define RETRY_INTERVAL_MS 500
-#define TIMEOUT_MS        5000
 #define STOP_TIMEOUT_US   5000000
+#define CACHE_DIR         "/var/lib/dbc-dispatcher"
+#define CACHE_FILE        CACHE_DIR "/last-app"
 
 static bool use_journal = false;
 
@@ -192,35 +193,17 @@ static void stop_unit(sd_bus *bus, const char *unit) {
         log_msg("stop %s: timed out or failed", unit);
 }
 
-static redisContext *connect_redis(void) {
-    struct timeval tv = {0, RETRY_INTERVAL_MS * 1000};
-    int elapsed_ms = 0;
-
-    while (elapsed_ms < TIMEOUT_MS) {
-        redisContext *ctx = redisConnectWithTimeout(REDIS_HOST, REDIS_PORT, tv);
-        if (ctx && ctx->err == 0)
-            return ctx;
-        if (ctx)
-            redisFree(ctx);
-        usleep(RETRY_INTERVAL_MS * 1000);
-        elapsed_ms += RETRY_INTERVAL_MS;
-    }
-
-    log_msg("redis unreachable after %dms, continuing anyway", TIMEOUT_MS);
-    return NULL;
-}
-
-static void read_setting(redisContext *ctx, char *buf, size_t bufsz) {
-    if (!ctx) {
-        snprintf(buf, bufsz, "%s", DEFAULT_APP);
-        return;
-    }
+/* Returns 0 on success (buf holds the configured app, or DEFAULT_APP when the
+ * field is unset), -1 when Redis couldn't be read — callers must not treat
+ * that as "use the default", the connection is broken. */
+static int read_setting(redisContext *ctx, char *buf, size_t bufsz) {
+    if (!ctx)
+        return -1;
 
     redisReply *reply = redisCommand(ctx, "HGET %s %s", REDIS_KEY, REDIS_FIELD);
     if (!reply) {
-        log_msg("redis read error: %s, using default", ctx->errstr);
-        snprintf(buf, bufsz, "%s", DEFAULT_APP);
-        return;
+        log_msg("redis read error: %s", ctx->errstr);
+        return -1;
     }
 
     if (reply->type == REDIS_REPLY_STRING && reply->len > 0)
@@ -229,6 +212,7 @@ static void read_setting(redisContext *ctx, char *buf, size_t bufsz) {
         snprintf(buf, bufsz, "%s", DEFAULT_APP);
 
     freeReplyObject(reply);
+    return 0;
 }
 
 static void do_poweroff(void) {
@@ -250,6 +234,60 @@ static char *strip(char *s) {
     while (end > s && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r'))
         *end-- = '\0';
     return s;
+}
+
+/* Last app Redis told us to run, persisted so the next boot can start it
+ * before the MDB is reachable over usb0. */
+static void cache_read(char *buf, size_t bufsz) {
+    snprintf(buf, bufsz, "%s", DEFAULT_APP);
+    FILE *f = fopen(CACHE_FILE, "r");
+    if (!f)
+        return;
+    char line[256];
+    if (fgets(line, sizeof(line), f)) {
+        char *s = strip(line);
+        if (*s)
+            snprintf(buf, bufsz, "%s", s);
+    }
+    fclose(f);
+}
+
+static void cache_write(const char *app) {
+    mkdir(CACHE_DIR, 0755);
+    static const char tmp[] = CACHE_FILE ".tmp";
+    FILE *f = fopen(tmp, "w");
+    if (!f) {
+        log_msg("cache write failed: %s", strerror(errno));
+        return;
+    }
+    fprintf(f, "%s\n", app);
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    if (rename(tmp, CACHE_FILE) != 0)
+        log_msg("cache rename failed: %s", strerror(errno));
+}
+
+/* Switch to new_app's unit if it differs from current_unit; updates
+ * current_unit and the on-disk cache on success. */
+static void switch_to(sd_bus *bus, const char *new_app, char *current_unit,
+                      size_t unitsz) {
+    char new_unit[512];
+    unit_name(new_app, new_unit, sizeof(new_unit));
+
+    if (strcmp(new_unit, current_unit) == 0)
+        return;
+
+    log_msg("switching %s -> %s", current_unit, new_unit);
+    stop_unit(bus, current_unit);
+    if (start_unit(bus, new_unit) != 0) {
+        log_msg("failed to start %s, reverting to %s", new_unit, current_unit);
+        if (start_unit(bus, current_unit) != 0)
+            log_msg("revert also failed");
+        return;
+    }
+    snprintf(current_unit, unitsz, "%s", new_unit);
+    cache_write(new_app);
 }
 
 int main(int argc, char **argv) {
@@ -308,13 +346,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Connect to Redis */
-    redisContext *rctx = connect_redis();
-
-    /* Read configured app */
+    /* Start the last known app immediately. Redis lives on the MDB and is
+     * only reachable once usb0 networking is up, seconds from now; the poll
+     * loop below reconciles against the actual setting when it can. */
     char app_name[256];
-    read_setting(rctx, app_name, sizeof(app_name));
-    log_msg("app=%s", app_name);
+    cache_read(app_name, sizeof(app_name));
+    log_msg("app=%s (cached)", app_name);
 
     char current_unit[512];
     unit_name(app_name, current_unit, sizeof(current_unit));
@@ -325,7 +362,6 @@ int main(int argc, char **argv) {
         if (strcmp(fallback, current_unit) == 0) {
             log_msg("failed to start %s, no fallback available", current_unit);
             sd_bus_unref(bus);
-            if (rctx) redisFree(rctx);
             return 1;
         }
         log_msg("falling back to %s", fallback);
@@ -333,36 +369,15 @@ int main(int argc, char **argv) {
         if (start_unit(bus, current_unit) != 0) {
             log_msg("failed to start fallback %s", current_unit);
             sd_bus_unref(bus);
-            if (rctx) redisFree(rctx);
             return 1;
         }
     }
 
-    /* Open a separate Redis connection for SUBSCRIBE */
+    redisContext *rctx = NULL;
     redisContext *sub_ctx = NULL;
-    if (rctx) {
-        struct timeval tv = {1, 0};
-        sub_ctx = redisConnectWithTimeout(REDIS_HOST, REDIS_PORT, tv);
-        if (!sub_ctx || sub_ctx->err) {
-            log_msg("redis subscribe connection failed");
-            if (sub_ctx) {
-                redisFree(sub_ctx);
-                sub_ctx = NULL;
-            }
-        }
-    }
-
-    if (sub_ctx) {
-        redisReply *reply = redisCommand(sub_ctx, "SUBSCRIBE %s %s",
-                                         SETTINGS_CHANNEL, COMMAND_CHANNEL);
-        if (reply) freeReplyObject(reply);
-        log_msg("watching %s and %s channels", SETTINGS_CHANNEL, COMMAND_CHANNEL);
-    } else {
-        log_msg("no redis subscription, running without live updates");
-    }
-
+    bool synced = false;
     bool shutting_down = false;
-    int sub_fd = sub_ctx ? sub_ctx->fd : -1;
+    int sub_fd = -1;
 
     /* Main event loop using poll */
     for (;;) {
@@ -379,12 +394,53 @@ int main(int argc, char **argv) {
             nfds++;
         }
 
-        int ret = poll(fds, nfds, -1);
+        int ret = poll(fds, nfds, synced ? -1 : 1000);
         if (ret < 0) {
             if (errno == EINTR)
                 continue;
             log_msg("poll: %s", strerror(errno));
             break;
+        }
+
+        /* Not yet synced with Redis: (re)establish and reconcile. Subscribe
+         * BEFORE reading the setting so a change can't slip between the two. */
+        if (ret == 0) {
+            struct timeval tv = {0, 500000};
+            if (!sub_ctx) {
+                sub_ctx = redisConnectWithTimeout(REDIS_HOST, REDIS_PORT, tv);
+                if (!sub_ctx || sub_ctx->err) {
+                    if (sub_ctx) {
+                        redisFree(sub_ctx);
+                        sub_ctx = NULL;
+                    }
+                    continue;
+                }
+                redisReply *r2 = redisCommand(sub_ctx, "SUBSCRIBE %s %s",
+                                              SETTINGS_CHANNEL, COMMAND_CHANNEL);
+                if (r2) freeReplyObject(r2);
+                sub_fd = sub_ctx->fd;
+                log_msg("watching %s and %s channels", SETTINGS_CHANNEL,
+                        COMMAND_CHANNEL);
+            }
+            if (!rctx) {
+                rctx = redisConnectWithTimeout(REDIS_HOST, REDIS_PORT, tv);
+                if (rctx && rctx->err) {
+                    redisFree(rctx);
+                    rctx = NULL;
+                }
+            }
+            if (rctx) {
+                char cfg_app[256];
+                if (read_setting(rctx, cfg_app, sizeof(cfg_app)) == 0) {
+                    switch_to(bus, cfg_app, current_unit, sizeof(current_unit));
+                    synced = true;
+                    log_msg("synced with redis, app=%s", cfg_app);
+                } else {
+                    redisFree(rctx);
+                    rctx = NULL;
+                }
+            }
+            continue;
         }
 
         /* Check for signals */
@@ -401,28 +457,17 @@ int main(int argc, char **argv) {
         if (nfds > 1 && (fds[1].revents & (POLLIN | POLLHUP | POLLERR))) {
             redisReply *reply = NULL;
             if (redisGetReply(sub_ctx, (void **)&reply) != REDIS_OK || !reply) {
-                log_msg("redis subscription lost, reconnecting...");
+                log_msg("redis subscription lost, resyncing...");
                 redisFree(sub_ctx);
                 sub_ctx = NULL;
                 sub_fd = -1;
-
-                /* Reconnect */
-                struct timeval tv = {1, 0};
-                sub_ctx = redisConnectWithTimeout(REDIS_HOST, REDIS_PORT, tv);
-                if (sub_ctx && !sub_ctx->err) {
-                    redisReply *r2 = redisCommand(sub_ctx, "SUBSCRIBE %s %s",
-                                                  SETTINGS_CHANNEL,
-                                                  COMMAND_CHANNEL);
-                    if (r2) freeReplyObject(r2);
-                    sub_fd = sub_ctx->fd;
-                    log_msg("redis subscription restored");
-                } else {
-                    if (sub_ctx) {
-                        redisFree(sub_ctx);
-                        sub_ctx = NULL;
-                    }
-                    log_msg("redis reconnect failed");
+                if (rctx) {
+                    redisFree(rctx);
+                    rctx = NULL;
                 }
+                /* Poll-timeout path re-subscribes and re-reads the setting,
+                 * so changes made while we were disconnected aren't lost. */
+                synced = false;
                 continue;
             }
 
@@ -460,26 +505,19 @@ int main(int argc, char **argv) {
                 } else if (strcmp(channel, SETTINGS_CHANNEL) == 0) {
                     if (strcmp(payload, REDIS_FIELD) == 0) {
                         char new_app[256];
-                        read_setting(rctx, new_app, sizeof(new_app));
-                        log_msg("setting %s changed, new value: %s", REDIS_FIELD,
-                                new_app);
-
-                        char new_unit[512];
-                        unit_name(new_app, new_unit, sizeof(new_unit));
-
-                        if (strcmp(new_unit, current_unit) != 0) {
-                            log_msg("switching %s -> %s", current_unit, new_unit);
-                            stop_unit(bus, current_unit);
-
-                            if (start_unit(bus, new_unit) != 0) {
-                                log_msg("failed to start %s, reverting to %s",
-                                        new_unit, current_unit);
-                                if (start_unit(bus, current_unit) != 0)
-                                    log_msg("revert also failed");
-                            } else {
-                                snprintf(current_unit, sizeof(current_unit), "%s",
-                                         new_unit);
+                        if (read_setting(rctx, new_app, sizeof(new_app)) == 0) {
+                            log_msg("setting %s changed, new value: %s",
+                                    REDIS_FIELD, new_app);
+                            switch_to(bus, new_app, current_unit,
+                                      sizeof(current_unit));
+                        } else {
+                            /* Data connection is broken; force a full resync
+                             * so the change isn't lost. */
+                            if (rctx) {
+                                redisFree(rctx);
+                                rctx = NULL;
                             }
+                            synced = false;
                         }
                     }
                 }
