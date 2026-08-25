@@ -24,7 +24,7 @@ jobs:
           sudo tee /etc/apt/sources.list.d/ubuntu-ports.sources > /dev/null <<PORTS
           Types: deb
           URIs: http://ports.ubuntu.com/ubuntu-ports/
-          Suites: $(lsb_release -cs) $(lsb_release -cs)-updates
+          Suites: $(lsb_release -cs) $(lsb_release -cs)-updates $(lsb_release -cs)-security
           Components: main universe
           Architectures: armhf
           Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
