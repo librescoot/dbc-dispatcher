@@ -4,6 +4,7 @@ VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev
 SRC := src/main.c
 
 CROSS_CC := arm-linux-gnueabihf-gcc
+CROSS_STRIP := arm-linux-gnueabihf-strip
 HOST_CC := gcc
 
 CFLAGS := -Wall -Wextra -Os -DVERSION=\"$(VERSION)\"
@@ -29,7 +30,7 @@ build-host:
 	$(HOST_CC) $(HOST_CFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) $(SRC) $(HOST_LDFLAGS)
 
 dist: build
-	strip $(BUILD_DIR)/$(BINARY_NAME)
+	$(CROSS_STRIP) $(BUILD_DIR)/$(BINARY_NAME)
 
 clean:
 	rm -rf $(BUILD_DIR)
