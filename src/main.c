@@ -49,7 +49,6 @@ static void log_msg(const char *fmt, ...) {
     fputc('\n', stderr);
 }
 
-/* Build unit name: append ".service" if not already present */
 static void unit_name(const char *app, char *buf, size_t bufsz) {
     size_t len = strlen(app);
     size_t sfxlen = strlen(UNIT_SUFFIX);
@@ -59,7 +58,6 @@ static void unit_name(const char *app, char *buf, size_t bufsz) {
         snprintf(buf, bufsz, "%s%s", app, UNIT_SUFFIX);
 }
 
-/* Wait for a systemd job to complete, return 0 on success */
 static int wait_for_job(sd_bus *bus, const char *job_path, const char *unit,
                         const char *action) {
     int r;
@@ -67,7 +65,6 @@ static int wait_for_job(sd_bus *bus, const char *job_path, const char *unit,
     clock_gettime(CLOCK_MONOTONIC, &deadline);
     deadline.tv_sec += STOP_TIMEOUT_US / 1000000;
 
-    /* Process bus messages until we see our job complete or timeout */
     for (;;) {
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
@@ -226,7 +223,6 @@ static void do_poweroff(void) {
     }
 }
 
-/* Strip leading/trailing whitespace in place */
 static char *strip(char *s) {
     while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r')
         s++;
@@ -252,6 +248,8 @@ static void cache_read(char *buf, size_t bufsz) {
     fclose(f);
 }
 
+/* Persist only after a successful switch, atomically, so early boot can start
+ * the last known display before Redis is reachable over usb0. */
 static void cache_write(const char *app) {
     mkdir(CACHE_DIR, 0755);
     static const char tmp[] = CACHE_FILE ".tmp";
@@ -268,8 +266,8 @@ static void cache_write(const char *app) {
         log_msg("cache rename failed: %s", strerror(errno));
 }
 
-/* Switch to new_app's unit if it differs from current_unit; updates
- * current_unit and the on-disk cache on success. */
+/* Start the replacement only after stopping the old unit; preserve the old
+ * selection and restart it if the new unit cannot start. */
 static void switch_to(sd_bus *bus, const char *new_app, char *current_unit,
                       size_t unitsz) {
     char new_unit[512];
@@ -300,7 +298,6 @@ int main(int argc, char **argv) {
 
     log_msg("dbc-dispatcher %s starting", VERSION);
 
-    /* Block SIGTERM and SIGINT, use signalfd */
     sigset_t mask;
     sigemptyset(&mask);
     sigaddset(&mask, SIGTERM);
@@ -332,7 +329,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Subscribe to JobRemoved signals for start/stop job tracking */
     r = sd_bus_add_match(bus, NULL,
         "type='signal',"
         "sender='org.freedesktop.systemd1',"
@@ -379,7 +375,6 @@ int main(int argc, char **argv) {
     bool shutting_down = false;
     int sub_fd = -1;
 
-    /* Main event loop using poll */
     for (;;) {
         struct pollfd fds[2];
         int nfds = 0;
@@ -443,7 +438,6 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        /* Check for signals */
         if (fds[0].revents & POLLIN) {
             struct signalfd_siginfo si;
             if (read(sfd, &si, sizeof(si)) == sizeof(si)) {
@@ -453,7 +447,6 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Check for Redis messages or connection errors */
         if (nfds > 1 && (fds[1].revents & (POLLIN | POLLHUP | POLLERR))) {
             redisReply *reply = NULL;
             if (redisGetReply(sub_ctx, (void **)&reply) != REDIS_OK || !reply) {
@@ -465,8 +458,7 @@ int main(int argc, char **argv) {
                     redisFree(rctx);
                     rctx = NULL;
                 }
-                /* Poll-timeout path re-subscribes and re-reads the setting,
-                 * so changes made while we were disconnected aren't lost. */
+                /* Reconcile after reconnecting so changes made while disconnected survive. */
                 synced = false;
                 continue;
             }
@@ -511,8 +503,7 @@ int main(int argc, char **argv) {
                             switch_to(bus, new_app, current_unit,
                                       sizeof(current_unit));
                         } else {
-                            /* Data connection is broken; force a full resync
-                             * so the change isn't lost. */
+                            /* Reconnect and reconcile rather than dropping this setting change. */
                             if (rctx) {
                                 redisFree(rctx);
                                 rctx = NULL;

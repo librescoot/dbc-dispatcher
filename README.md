@@ -1,74 +1,96 @@
-# dbc-dispatcher
-
-Manages display applications on the Dashboard Computer (DBC) as systemd units. Reads the configured app from Redis, starts it via D-Bus, and watches for live app switches and power commands.
+# Librescoot DBC Dispatcher
 
 Part of the [Librescoot](https://librescoot.org/) open-source platform.
 
-Written in C for fast startup on the i.MX6 DL (ARMv7). Statically linked, no runtime dependencies.
+## Overview
 
-## How it works
+`dbc-dispatcher` is the systemd-based display application supervisor for a
+Librescoot Dashboard Computer (DBC). It selects a display application from the
+vehicle datastore, starts and stops its systemd unit, and remains running to
+apply later changes.
 
-1. Connect to Redis and systemd D-Bus
-2. Read `HGET settings dashboard.app` for the app name
-3. Start `<app>.service` via D-Bus (falls back to `scootui-qt` on failure)
-4. Subscribe to Redis PUBSUB on `settings` and `dbc:command`
-5. On app change: stop current unit, start new one (reverts on failure)
-6. On `poweroff` command: stop current unit, run `poweroff`
+## Capabilities
 
-The dispatcher stays running for the lifetime of the DBC session.
+- Starts the configured display application through systemd's private D-Bus
+  interface.
+- Starts the last successfully selected application before the datastore is
+  reachable, improving display startup after boot.
+- Reconciles the selected application when datastore connectivity returns.
+- Watches for live application changes and rolls back to the previous unit if
+  the replacement does not start.
+- Responds to a dashboard power-off command and handles orderly termination.
 
-## Build
+## Operation and interfaces
 
-Requires `libsystemd-dev` and `libhiredis-dev`. For cross-compilation, install the `armhf` variants plus `gcc-arm-linux-gnueabihf`.
+The dispatcher reads `settings[dashboard.app]`; its value is mapped to a
+systemd unit by appending `.service` when needed. If the setting is absent, the
+default is `scootui-qt`. It subscribes to these pub/sub channels:
 
-```sh
-# ARM target (production, armv7 static binary)
-make build
+| Channel | Payload | Action |
+| --- | --- | --- |
+| `settings` | `dashboard.app` | Re-read the setting and switch the managed unit |
+| `dbc:command` | `poweroff` | Invoke `poweroff` |
 
-# Host platform (development, dynamically linked)
-make build-host
+The active selection is persisted in `/var/lib/dbc-dispatcher/last-app` after a
+successful switch. At startup, that cache is used before a datastore connection
+is available; the dispatcher then reconciles it with `settings[dashboard.app]`.
 
-# Stripped ARM binary for distribution
-make dist
-```
-
-## Flags
-
-| Flag | Description |
-|---|---|
-| `--version` | Print version and exit |
-
-Redis host (`192.168.7.1:6379`) and timeout (5s) are compiled in. If Redis is unreachable after the timeout, the dispatcher continues with the default app.
-
-## Redis API
-
-| Operation | Key/Channel | Field | Description |
-|---|---|---|---|
-| `HGET` | `settings` | `dashboard.app` | App name (read at startup) |
-| `SUBSCRIBE` | `settings` | -- | Watches for setting changes (filters for `dashboard.app` payload) |
-| `SUBSCRIBE` | `dbc:command` | -- | Commands (`poweroff`) |
-
-The app name maps directly to a systemd unit: `scootui-qt` -> `scootui-qt.service`. Default is `scootui-qt`.
-
-## App switching
-
-Change the app via the settings hash:
+`dbc-dispatcher --version` prints the compiled version. All other operation is
+through its systemd unit, for example:
 
 ```sh
-redis-cli hset settings dashboard.app carplay
-redis-cli publish settings dashboard.app
-# dispatcher re-reads the value, stops scootui-qt.service, starts carplay.service
+systemctl status dbc-dispatcher.service
+journalctl -u dbc-dispatcher.service
 ```
 
-If the new unit fails to start, the dispatcher reverts to the previous one.
+## Configuration
+
+There is no configuration file or command-line configuration. The datastore
+host and port are compiled as `192.168.7.1:6379`, and the default application is
+`scootui-qt`. Configure the selected application by writing the settings hash
+and publishing the changed key:
+
+```sh
+redis-cli HSET settings dashboard.app scootui-qt
+redis-cli PUBLISH settings dashboard.app
+```
+
+The configured value names a systemd unit. Only select units that are installed
+and appropriate for the DBC.
+
+## Build and test
+
+The project has a single C source file and no automated test target. Build with:
+
+```sh
+make build-host   # host binary in bin/dbc-dispatcher
+make build        # ARMv7 cross-build in bin/dbc-dispatcher
+make dist         # ARMv7 build, then strip it
+```
+
+Host builds require `gcc`, `pkg-config`, and development packages for
+`libsystemd` and `hiredis`. The ARM build additionally requires
+`arm-linux-gnueabihf-gcc`, `arm-linux-gnueabihf-strip`, and ARM-target
+`pkg-config` metadata for those libraries.
+
+## Deployment and runtime dependencies
+
+The Yocto recipe installs `/usr/bin/dbc-dispatcher` and enables
+`dbc-dispatcher.service`. At runtime it requires systemd (including
+`/run/systemd/private`), a Redis-compatible server at the compiled endpoint,
+and the display application units it may manage. The service runs as root,
+restarts after three seconds on failure, and logs to the system journal.
+
+## Operational notes
+
+The dispatcher is privileged: a datastore setting determines which systemd unit
+it starts, and the `poweroff` command powers off the host. Restrict write and
+publish access to the datastore accordingly. A failed replacement application
+is reverted, but an invalid cached application can still delay startup until the
+fallback or datastore reconciliation succeeds.
 
 ## License
 
-This project is dual-licensed. The source code is available under the
-[Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License][cc-by-nc-sa].
-The maintainers reserve the right to grant separate licenses for commercial distribution; please contact the maintainers to discuss commercial licensing.
+This project is licensed under the [Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License](LICENSE).
 
-[![CC BY-NC-SA 4.0][cc-by-nc-sa-image]][cc-by-nc-sa]
-
-[cc-by-nc-sa]: http://creativecommons.org/licenses/by-nc-sa/4.0/
-[cc-by-nc-sa-image]: https://licensebuttons.net/l/by-nc-sa/4.0/88x31.png
+Made with ❤️ by the Librescoot community
