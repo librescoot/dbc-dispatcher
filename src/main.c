@@ -8,8 +8,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/signalfd.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <systemd/sd-bus.h>
 #include <time.h>
 #include <unistd.h>
@@ -29,6 +31,21 @@
 #define STOP_TIMEOUT_US   5000000
 #define CACHE_DIR         "/var/lib/dbc-dispatcher"
 #define CACHE_FILE        CACHE_DIR "/last-app"
+
+/* The boot logo, animation and startup sound are chosen by U-Boot from its own
+ * environment, which only something running on the DBC can write. A request
+ * therefore arrives as desired state in Redis and is reconciled here: on every
+ * start, and immediately when a live request arrives. Desired state rather
+ * than a queue, so it converges to the latest value and cannot replay a stale
+ * request; a field rather than a channel, so a request made while the DBC is
+ * powered off is still there when it next starts. */
+#define ANIM_DIR          "/usr/share/boot-animation"
+#define BOOT_DESIRED_KEY  "boot:desired"
+#define BOOT_STATE_KEY    "boot:dbc"
+#define BOOT_CHANNEL      "boot:command"
+#define BOOT_THEME_VAR    "boot_animation"
+#define BOOT_SOUND_VAR    "boot_sound"
+#define BOOT_DEFAULT_THEME "librescoot"
 
 static bool use_journal = false;
 
@@ -288,6 +305,182 @@ static void switch_to(sd_bus *bus, const char *new_app, char *current_unit,
     cache_write(new_app);
 }
 
+/* --- boot theme and sound ------------------------------------------------ */
+
+/* A theme name reaches fw_setenv verbatim, so keep it to a shape a theme name
+ * can take and nothing else. */
+static int valid_theme_name(const char *name) {
+    if (!name || !*name)
+        return 0;
+    for (const char *p = name; *p; p++) {
+        if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+            (*p >= '0' && *p <= '9') || *p == '.' || *p == '_' || *p == '-')
+            continue;
+        return 0;
+    }
+    return 1;
+}
+
+static int theme_installed(const char *name) {
+    char path[512];
+    if (!valid_theme_name(name))
+        return 0;
+    snprintf(path, sizeof(path), ANIM_DIR "/%s.json", name);
+    return access(path, R_OK) == 0;
+}
+
+/* Read one variable from the U-Boot environment. An unset variable is not an
+ * error: it leaves the buffer empty, which every caller treats as a default.
+ * Returns -1 only when fw_printenv itself could not run. */
+static int env_get(const char *key, char *buf, size_t bufsz) {
+    char cmd[256];
+    if (bufsz == 0)
+        return -1;
+    buf[0] = '\0';
+    snprintf(cmd, sizeof(cmd), "fw_printenv -n %s 2>/dev/null", key);
+    FILE *f = popen(cmd, "r");
+    if (!f)
+        return -1;
+    if (fgets(buf, (int)bufsz, f)) {
+        char *s = strip(buf);
+        if (s != buf)
+            memmove(buf, s, strlen(s) + 1);
+    }
+    int status = pclose(f);
+    if (status == -1 || !WIFEXITED(status))
+        return -1;
+    return 0;
+}
+
+static int env_set(const char *key, const char *value) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        log_msg("fw_setenv fork failed: %s", strerror(errno));
+        return -1;
+    }
+    if (pid == 0) {
+        execlp("fw_setenv", "fw_setenv", key, value, (char *)NULL);
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid)
+        return -1;
+    return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+}
+
+/* Publish what the environment actually holds, so a caller can read the
+ * current theme without reaching this board. */
+static void publish_boot_state(redisContext *ctx, const char *note) {
+    if (!ctx)
+        return;
+    char theme[128];
+    char sound[16];
+    if (env_get(BOOT_THEME_VAR, theme, sizeof(theme)) != 0 || !theme[0])
+        snprintf(theme, sizeof(theme), "%s", BOOT_DEFAULT_THEME);
+    if (env_get(BOOT_SOUND_VAR, sound, sizeof(sound)) != 0 || !sound[0])
+        snprintf(sound, sizeof(sound), "1");
+
+    /* redisCommand splits its formatted string on whitespace, so every value
+     * here is a single token by construction. */
+    redisReply *r = redisCommand(ctx,
+        "HSET %s theme %s sound %s note %s updated %ld",
+        BOOT_STATE_KEY, theme, sound, note ? note : "ok", (long)time(NULL));
+    if (r)
+        freeReplyObject(r);
+}
+
+static void desired_field(redisContext *ctx, const char *field, char *buf, size_t bufsz) {
+    buf[0] = '\0';
+    redisReply *r = redisCommand(ctx, "HGET %s %s", BOOT_DESIRED_KEY, field);
+    if (r) {
+        if (r->type == REDIS_REPLY_STRING && r->len > 0)
+            snprintf(buf, bufsz, "%s", r->str);
+        freeReplyObject(r);
+    }
+}
+
+/* Make the environment match boot:desired. Runs at every start and after
+ * every live request, so it has to be safe to repeat. */
+static void apply_boot_desired(redisContext *ctx) {
+    if (!ctx)
+        return;
+
+    char theme[128];
+    char sound[16];
+    char current[128];
+    char note[32] = "ok";
+
+    desired_field(ctx, "theme", theme, sizeof(theme));
+    desired_field(ctx, "sound", sound, sizeof(sound));
+
+    if (theme[0]) {
+        if (!theme_installed(theme)) {
+            /* Refuse rather than write a name nothing can boot: the fallback
+             * is silent, and the caller would have no idea. */
+            snprintf(note, sizeof(note), "unknown-theme");
+            log_msg("boot: refusing unknown theme %s", theme);
+        } else if (env_get(BOOT_THEME_VAR, current, sizeof(current)) != 0) {
+            snprintf(note, sizeof(note), "env-error");
+        } else if (strcmp(current, theme) != 0) {
+            if (env_set(BOOT_THEME_VAR, theme) == 0)
+                log_msg("boot: theme -> %s", theme);
+            else
+                snprintf(note, sizeof(note), "env-error");
+        }
+    }
+
+    if (sound[0]) {
+        const char *value = NULL;
+        if (!strcasecmp(sound, "1") || !strcasecmp(sound, "on") || !strcasecmp(sound, "true"))
+            value = "1";
+        else if (!strcasecmp(sound, "0") || !strcasecmp(sound, "off") || !strcasecmp(sound, "false"))
+            value = "0";
+
+        if (!value) {
+            snprintf(note, sizeof(note), "bad-sound");
+        } else if (env_get(BOOT_SOUND_VAR, current, sizeof(current)) != 0) {
+            snprintf(note, sizeof(note), "env-error");
+        } else if (strcmp(current, value) != 0) {
+            if (env_set(BOOT_SOUND_VAR, value) == 0)
+                log_msg("boot: sound -> %s", value);
+            else
+                snprintf(note, sizeof(note), "env-error");
+        }
+    }
+
+    publish_boot_state(ctx, note);
+}
+
+/* Handle "boot-theme <name>" and "boot-sound <on|off>". The request is written
+ * to boot:desired first, so it still applies if this process is restarted
+ * before the next boot. */
+static void handle_boot_request(redisContext *ctx, char *payload) {
+    if (!ctx) {
+        log_msg("boot: request dropped, redis is down");
+        return;
+    }
+    char *sp = strchr(payload, ' ');
+    if (!sp) {
+        log_msg("boot: malformed request '%s'", payload);
+        return;
+    }
+    *sp = '\0';
+    char *value = strip(sp + 1);
+
+    const char *field = strcmp(payload, "boot-theme") == 0 ? "theme"
+                      : strcmp(payload, "boot-sound") == 0 ? "sound"
+                      : NULL;
+    if (!field || !*value) {
+        log_msg("boot: unknown request '%s'", payload);
+        return;
+    }
+
+    redisReply *r = redisCommand(ctx, "HSET %s %s %s", BOOT_DESIRED_KEY, field, value);
+    if (r)
+        freeReplyObject(r);
+    apply_boot_desired(ctx);
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "--version") == 0) {
         printf("dbc-dispatcher %s\n", VERSION);
@@ -410,12 +603,13 @@ int main(int argc, char **argv) {
                     }
                     continue;
                 }
-                redisReply *r2 = redisCommand(sub_ctx, "SUBSCRIBE %s %s",
-                                              SETTINGS_CHANNEL, COMMAND_CHANNEL);
+                redisReply *r2 = redisCommand(sub_ctx, "SUBSCRIBE %s %s %s",
+                                              SETTINGS_CHANNEL, COMMAND_CHANNEL,
+                                              BOOT_CHANNEL);
                 if (r2) freeReplyObject(r2);
                 sub_fd = sub_ctx->fd;
-                log_msg("watching %s and %s channels", SETTINGS_CHANNEL,
-                        COMMAND_CHANNEL);
+                log_msg("watching %s, %s and %s channels", SETTINGS_CHANNEL,
+                        COMMAND_CHANNEL, BOOT_CHANNEL);
             }
             if (!rctx) {
                 rctx = redisConnectWithTimeout(REDIS_HOST, REDIS_PORT, tv);
@@ -428,6 +622,10 @@ int main(int argc, char **argv) {
                 char cfg_app[256];
                 if (read_setting(rctx, cfg_app, sizeof(cfg_app)) == 0) {
                     switch_to(bus, cfg_app, current_unit, sizeof(current_unit));
+                    /* The DBC's U-Boot environment is only writable from here,
+                     * so this is where a theme requested while the scooter was
+                     * asleep gets applied. */
+                    apply_boot_desired(rctx);
                     synced = true;
                     log_msg("synced with redis, app=%s", cfg_app);
                 } else {
@@ -494,6 +692,8 @@ int main(int argc, char **argv) {
                     } else {
                         log_msg("unknown command: %s", payload);
                     }
+                } else if (strcmp(channel, BOOT_CHANNEL) == 0) {
+                    handle_boot_request(rctx, payload);
                 } else if (strcmp(channel, SETTINGS_CHANNEL) == 0) {
                     if (strcmp(payload, REDIS_FIELD) == 0) {
                         char new_app[256];
