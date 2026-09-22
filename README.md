@@ -18,6 +18,10 @@ apply later changes.
 - Reconciles the selected application when datastore connectivity returns.
 - Watches for live application changes and rolls back to the previous unit if
   the replacement does not start.
+- Applies `settings[scooter.logserver]`: rewrites
+  `/etc/systemd/journal-upload.conf` and enables/restarts
+  `systemd-journal-upload` when set, stops and disables it when unset — the
+  same settings-service behaviour the MDB applies to its own copy.
 - Responds to a dashboard power-off command and handles orderly termination.
 
 ## Operation and interfaces
@@ -29,6 +33,7 @@ default is `scootui-qt`. It subscribes to these pub/sub channels:
 | Channel | Payload | Action |
 | --- | --- | --- |
 | `settings` | `dashboard.app` | Re-read the setting and switch the managed unit |
+| `settings` | `scooter.logserver` | Re-read the setting and (re)apply journal-upload |
 | `dbc:command` | `poweroff` | Invoke `poweroff` |
 
 The active selection is persisted in `/var/lib/dbc-dispatcher/last-app` after a

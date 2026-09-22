@@ -27,6 +27,9 @@
 #define REDIS_FIELD      "dashboard.app"
 #define SETTINGS_CHANNEL "settings"
 #define COMMAND_CHANNEL  "dbc:command"
+#define LOGSERVER_FIELD  "scooter.logserver"
+#define JOURNAL_UNIT     "systemd-journal-upload.service"
+#define JOURNAL_CONF     "/etc/systemd/journal-upload.conf"
 #define UNIT_SUFFIX      ".service"
 #define STOP_TIMEOUT_US   5000000
 #define CACHE_DIR         "/var/lib/dbc-dispatcher"
@@ -303,6 +306,124 @@ static void switch_to(sd_bus *bus, const char *new_app, char *current_unit,
     }
     snprintf(current_unit, unitsz, "%s", new_unit);
     cache_write(new_app);
+}
+
+/* --- journal upload ------------------------------------------------------ */
+
+static int run_cmd(char *const argv[]) {
+    pid_t pid = fork();
+    if (pid < 0)
+        return -1;
+    if (pid == 0) {
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid)
+        return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static int read_logserver(redisContext *ctx, char *buf, size_t bufsz) {
+    if (!ctx)
+        return -1;
+    buf[0] = '\0';
+    redisReply *reply = redisCommand(ctx, "HGET %s %s", REDIS_KEY, LOGSERVER_FIELD);
+    if (!reply) {
+        log_msg("redis read error: %s", ctx->errstr);
+        return -1;
+    }
+    if (reply->type == REDIS_REPLY_STRING)
+        snprintf(buf, bufsz, "%s", reply->str);
+    freeReplyObject(reply);
+    return 0;
+}
+
+/* URL currently in the conf's [Upload] section; empty when absent. */
+static void conf_url(char *buf, size_t bufsz) {
+    buf[0] = '\0';
+    FILE *f = fopen(JOURNAL_CONF, "r");
+    if (!f)
+        return;
+    char line[1024];
+    int in_upload = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char *s = strip(line);
+        if (*s == '#' || !*s)
+            continue;
+        if (*s == '[') {
+            in_upload = strcmp(s, "[Upload]") == 0;
+            continue;
+        }
+        if (in_upload && strncmp(s, "URL=", 4) == 0) {
+            snprintf(buf, bufsz, "%s", s + 4);
+            break;
+        }
+    }
+    fclose(f);
+}
+
+/* Same content settings-service writes on the MDB, replaced atomically. */
+static int conf_write(const char *url) {
+    static const char tmp[] = JOURNAL_CONF ".tmp";
+    FILE *f = fopen(tmp, "w");
+    if (!f) {
+        log_msg("journal-upload conf write failed: %s", strerror(errno));
+        return -1;
+    }
+    fprintf(f, "[Upload]\nURL=%s\nServerKeyFile=-\nServerCertificateFile=-\n"
+               "TrustedCertificateFile=-\n", url);
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    if (rename(tmp, JOURNAL_CONF) != 0) {
+        log_msg("journal-upload conf rename failed: %s", strerror(errno));
+        remove(tmp);
+        return -1;
+    }
+    return 0;
+}
+
+/* scooter.logserver drives journal-upload on this board the way
+ * settings-service drives it on the MDB: unset stops and disables it, set
+ * rewrites the conf and enables/restarts it. Returns -1 only when the read
+ * from Redis failed, so callers can resync instead of dropping the change. */
+static int apply_logserver(redisContext *ctx) {
+    char url[512];
+    char current[512];
+
+    if (read_logserver(ctx, url, sizeof(url)) != 0)
+        return -1;
+
+    /* The URL lands in the conf verbatim; a newline would corrupt it. */
+    if (strchr(url, '\n') || strchr(url, '\r')) {
+        log_msg("log server: refusing URL containing a newline");
+        url[0] = '\0';
+    }
+
+    if (!url[0]) {
+        if (run_cmd((char *[]){"systemctl", "disable", "--now", JOURNAL_UNIT, NULL}) == 0)
+            log_msg("log server unset, journal-upload stopped and disabled");
+        else
+            log_msg("failed to stop/disable %s", JOURNAL_UNIT);
+        return 0;
+    }
+
+    conf_url(current, sizeof(current));
+    bool changed = strcmp(current, url) != 0;
+    if (changed && conf_write(url) != 0)
+        return 0;
+
+    bool active = run_cmd((char *[]){"systemctl", "is-active", "--quiet", JOURNAL_UNIT, NULL}) == 0;
+    if (changed || !active) {
+        if (run_cmd((char *[]){"systemctl", "enable", JOURNAL_UNIT, NULL}) != 0 ||
+            run_cmd((char *[]){"systemctl", "restart", JOURNAL_UNIT, NULL}) != 0) {
+            log_msg("failed to enable/restart %s", JOURNAL_UNIT);
+            return 0;
+        }
+        log_msg("log server %s, journal-upload enabled", url);
+    }
+    return 0;
 }
 
 /* --- boot theme and sound ------------------------------------------------ */
@@ -626,6 +747,7 @@ int main(int argc, char **argv) {
                      * so this is where a theme requested while the scooter was
                      * asleep gets applied. */
                     apply_boot_desired(rctx);
+                    apply_logserver(rctx);
                     synced = true;
                     log_msg("synced with redis, app=%s", cfg_app);
                 } else {
@@ -704,6 +826,14 @@ int main(int argc, char **argv) {
                                       sizeof(current_unit));
                         } else {
                             /* Reconnect and reconcile rather than dropping this setting change. */
+                            if (rctx) {
+                                redisFree(rctx);
+                                rctx = NULL;
+                            }
+                            synced = false;
+                        }
+                    } else if (strcmp(payload, LOGSERVER_FIELD) == 0) {
+                        if (apply_logserver(rctx) != 0) {
                             if (rctx) {
                                 redisFree(rctx);
                                 rctx = NULL;
