@@ -12,7 +12,11 @@ PKG_CONFIG := pkg-config
 CROSS_PKG_CONFIG_ENV := PKG_CONFIG_LIBDIR=/usr/lib/arm-linux-gnueabihf/pkgconfig
 
 CROSS_CFLAGS := $(CFLAGS) $(shell $(CROSS_PKG_CONFIG_ENV) $(PKG_CONFIG) --cflags libsystemd hiredis 2>/dev/null)
-CROSS_LDFLAGS := $(shell $(CROSS_PKG_CONFIG_ENV) $(PKG_CONFIG) --libs libsystemd hiredis 2>/dev/null)
+# The distro cross libhiredis records DT_NEEDED=libhiredis.so.1.1.0, a soname
+# the Yocto image does not ship (it has libhiredis.so.1), so ARM binaries must
+# take the static archive. libsystemd stays dynamic: libsystemd.so.0 matches.
+CROSS_STATIC_LIBS := /usr/lib/arm-linux-gnueabihf/libhiredis.a
+CROSS_LDFLAGS := $(shell $(CROSS_PKG_CONFIG_ENV) $(PKG_CONFIG) --libs libsystemd 2>/dev/null) $(CROSS_STATIC_LIBS)
 
 HOST_CFLAGS := $(CFLAGS) $(shell $(PKG_CONFIG) --cflags libsystemd hiredis 2>/dev/null)
 HOST_LDFLAGS := $(shell $(PKG_CONFIG) --libs libsystemd hiredis 2>/dev/null)
