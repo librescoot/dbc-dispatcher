@@ -1,9 +1,11 @@
 #define _GNU_SOURCE
 #include <errno.h>
+#include <dirent.h>
 #include <hiredis/hiredis.h>
 #include <poll.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdint.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -40,6 +42,8 @@
 #define CACHE_FILE        CACHE_DIR "/last-app"
 #define MEDIA_DIR         "/data/dbc-dispatcher"
 #define MEDIA_LIMIT       (100 * 1024 * 1024)
+#define MEDIA_CACHE_BYTES (256 * 1024 * 1024)
+#define MEDIA_CACHE_ITEMS 8
 #define MEDIA_URL_MAX     2048
 
 /* The boot logo, animation and startup sound are chosen by U-Boot from its own
@@ -394,11 +398,81 @@ static int copy_media(const char *source, const char *target) {
     return ok;
 }
 
-static void media_clean_cache(void) {
-    unlink(MEDIA_DIR "/incoming.part");
-    unlink(MEDIA_DIR "/media.mp4");
-    unlink(MEDIA_DIR "/media.jpg");
-    unlink(MEDIA_DIR "/media.png");
+static bool cache_name(const char *name) {
+    size_t len = strlen(name);
+    if (len != 20 && len != 21) return false;
+    for (int i = 0; i < 16; i++)
+        if (!((name[i] >= '0' && name[i] <= '9') ||
+              (name[i] >= 'a' && name[i] <= 'f'))) return false;
+    return !strcmp(name + 16, ".mp4") || !strcmp(name + 16, ".jpg") ||
+           !strcmp(name + 16, ".png");
+}
+
+static void cache_path(const char *source, const char *ext, char *path, size_t size) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (const unsigned char *p = (const unsigned char *)source; *p; p++) {
+        hash ^= *p;
+        hash *= UINT64_C(1099511628211);
+    }
+    snprintf(path, size, MEDIA_DIR "/%016llx.%s", (unsigned long long)hash, ext);
+}
+
+static void media_clear_cache(const char *directory, const char *keep) {
+    DIR *dir = opendir(directory);
+    if (!dir) return;
+    struct dirent *entry;
+    while ((entry = readdir(dir))) {
+        if (!cache_name(entry->d_name)) continue;
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", directory, entry->d_name);
+        if (!keep || strcmp(path, keep)) unlink(path);
+    }
+    closedir(dir);
+    char staged[PATH_MAX];
+    snprintf(staged, sizeof(staged), "%s/incoming.part", directory);
+    unlink(staged);
+    const char *legacy[] = {"mp4", "jpg", "png"};
+    for (size_t i = 0; i < 3; i++) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/media.%s", directory, legacy[i]);
+        unlink(path);
+    }
+}
+
+static void media_prune(const char *directory, const char *keep) {
+    /* The most recently played item survives even when it alone exceeds the budget. */
+    for (;;) {
+        DIR *dir = opendir(directory);
+        if (!dir) return;
+        struct dirent *entry;
+        off_t bytes = 0;
+        int count = 0;
+        char oldest[PATH_MAX] = "";
+        struct timespec oldest_time = {0};
+        while ((entry = readdir(dir))) {
+            if (!cache_name(entry->d_name)) continue;
+            char path[PATH_MAX];
+            snprintf(path, sizeof(path), "%s/%s", directory, entry->d_name);
+            struct stat st;
+            if (lstat(path, &st) || !S_ISREG(st.st_mode)) continue;
+            bytes += st.st_size;
+            count++;
+            if (keep && !strcmp(path, keep)) continue;
+            if (!oldest[0] || st.st_mtim.tv_sec < oldest_time.tv_sec ||
+                (st.st_mtim.tv_sec == oldest_time.tv_sec &&
+                 st.st_mtim.tv_nsec < oldest_time.tv_nsec)) {
+                snprintf(oldest, sizeof(oldest), "%s", path);
+                oldest_time = st.st_mtim;
+            }
+        }
+        closedir(dir);
+        if (count <= MEDIA_CACHE_ITEMS && bytes <= MEDIA_CACHE_BYTES) return;
+        if (!oldest[0]) return;
+        if (unlink(oldest) != 0) {
+            log_msg("media: cache eviction failed: %s", strerror(errno));
+            return;
+        }
+    }
 }
 
 static void media_cancel(Media *m, sd_bus *bus, const char *unit, bool restore) {
@@ -407,14 +481,55 @@ static void media_cancel(Media *m, sd_bus *bus, const char *unit, bool restore) 
     m->staged[0] = '\0';
     m->next[0] = '\0';
     kill_child(&m->player);
-    if (m->cached[0]) unlink(m->cached);
     m->cached[0] = '\0';
-    media_clean_cache();
     if (restore && start_unit(bus, unit) != 0)
         log_msg("media: failed to restore %s", unit);
 }
 
-static void media_request(Media *m, const char *source) {
+static void media_start(Media *m, sd_bus *bus, const char *unit, bool refreshed) {
+    if (!refreshed && m->player > 0 && !strcmp(m->cached, m->next)) {
+        utimensat(AT_FDCWD, m->cached, NULL, 0);
+        media_prune(MEDIA_DIR, m->cached);
+        return;
+    }
+    bool had_player = m->player > 0;
+    kill_child(&m->player);
+    if (!had_player && stop_unit(bus, unit) != 0) {
+        log_msg("media: could not stop %s", unit);
+        return;
+    }
+    snprintf(m->cached, sizeof(m->cached), "%s", m->next);
+    pid_t pid = fork();
+    if (pid == 0) {
+        child_signals();
+        if (getppid() == 1) _exit(1);
+        if (m->video)
+            execlp("ffmpeg", "ffmpeg", "-hide_banner", "-loglevel", "warning",
+                   "-nostdin", "-re", "-stream_loop", "-1", "-i", m->cached,
+                   "-an", "-vf", "scale=480:480:force_original_aspect_ratio=decrease,"
+                   "pad=480:480:(ow-iw)/2:(oh-ih)/2", "-pix_fmt", "bgra",
+                   "-f", "fbdev", "/dev/fb0", (char *)NULL);
+        else
+            execlp("ffmpeg", "ffmpeg", "-hide_banner", "-loglevel", "warning",
+                   "-nostdin", "-loop", "1", "-framerate", "1", "-re",
+                   "-i", m->cached, "-vf", "scale=480:480:force_original_aspect_ratio=decrease,"
+                   "pad=480:480:(ow-iw)/2:(oh-ih)/2", "-pix_fmt", "bgra",
+                   "-f", "fbdev", "/dev/fb0", (char *)NULL);
+        _exit(127);
+    }
+    if (pid < 0) {
+        log_msg("media: player fork: %s", strerror(errno));
+        m->cached[0] = '\0';
+        start_unit(bus, unit);
+        return;
+    }
+    m->player = pid;
+    utimensat(AT_FDCWD, m->cached, NULL, 0);
+    media_prune(MEDIA_DIR, m->cached);
+    log_msg("media: displaying %s (pid %d)", m->cached, (int)pid);
+}
+
+static void media_request(Media *m, sd_bus *bus, const char *unit, const char *source) {
     size_t length = strlen(source);
     if (!length || length >= MEDIA_URL_MAX || strchr(source, '\n') || strchr(source, '\r')) {
         log_msg("media: invalid source length or characters");
@@ -430,12 +545,23 @@ static void media_request(Media *m, const char *source) {
         log_msg("media: mkdir: %s", strerror(errno));
         return;
     }
-    if (m->player <= 0 && m->fetch <= 0) media_clean_cache();
     kill_child(&m->fetch);
     if (m->staged[0]) unlink(m->staged);
-    snprintf(m->staged, sizeof(m->staged), MEDIA_DIR "/incoming.part");
-    snprintf(m->next, sizeof(m->next), MEDIA_DIR "/media.%s", ext);
+    m->staged[0] = '\0';
+    cache_path(source, ext, m->next, sizeof(m->next));
     m->video = strcmp(ext, "mp4") == 0;
+    struct stat cached, original;
+    if (!lstat(m->next, &cached) && S_ISREG(cached.st_mode) &&
+        cached.st_size > 0 && cached.st_size <= MEDIA_LIMIT &&
+        (remote || (stat(source, &original) == 0 &&
+                    original.st_mtim.tv_sec <= cached.st_mtim.tv_sec &&
+                    (original.st_mtim.tv_sec < cached.st_mtim.tv_sec ||
+                     original.st_mtim.tv_nsec <= cached.st_mtim.tv_nsec)))) {
+        log_msg("media: cache hit for %s", source);
+        media_start(m, bus, unit, false);
+        return;
+    }
+    snprintf(m->staged, sizeof(m->staged), MEDIA_DIR "/incoming.part");
     pid_t pid = fork();
     if (pid < 0) {
         log_msg("media: fork: %s", strerror(errno));
@@ -470,55 +596,14 @@ static void media_poll(Media *m, sd_bus *bus, const char *unit) {
             m->staged[0] = '\0';
             return;
         }
-        bool had_player = m->player > 0;
-        kill_child(&m->player);
         if (rename(m->staged, m->next) != 0) {
             log_msg("media: cache rename: %s", strerror(errno));
             unlink(m->staged);
             m->staged[0] = '\0';
-            if (had_player) {
-                if (m->cached[0]) unlink(m->cached);
-                m->cached[0] = '\0';
-                start_unit(bus, unit);
-            }
             return;
         }
         m->staged[0] = '\0';
-        if (m->cached[0] && strcmp(m->cached, m->next)) unlink(m->cached);
-        snprintf(m->cached, sizeof(m->cached), "%s", m->next);
-        if (!had_player && stop_unit(bus, unit) != 0) {
-            log_msg("media: could not stop %s", unit);
-            unlink(m->cached);
-            m->cached[0] = '\0';
-            return;
-        }
-        pid_t pid = fork();
-        if (pid == 0) {
-            child_signals();
-            if (getppid() == 1) _exit(1);
-            if (m->video)
-                execlp("ffmpeg", "ffmpeg", "-hide_banner", "-loglevel", "warning",
-                       "-nostdin", "-re", "-stream_loop", "-1", "-i", m->cached,
-                       "-an", "-vf", "scale=480:480:force_original_aspect_ratio=decrease,"
-                       "pad=480:480:(ow-iw)/2:(oh-ih)/2", "-pix_fmt", "bgra",
-                       "-f", "fbdev", "/dev/fb0", (char *)NULL);
-            else
-                execlp("ffmpeg", "ffmpeg", "-hide_banner", "-loglevel", "warning",
-                       "-nostdin", "-loop", "1", "-framerate", "1", "-re",
-                       "-i", m->cached, "-vf", "scale=480:480:force_original_aspect_ratio=decrease,"
-                       "pad=480:480:(ow-iw)/2:(oh-ih)/2", "-pix_fmt", "bgra",
-                       "-f", "fbdev", "/dev/fb0", (char *)NULL);
-            _exit(127);
-        }
-        if (pid < 0) {
-            log_msg("media: player fork: %s", strerror(errno));
-            unlink(m->cached);
-            m->cached[0] = '\0';
-            start_unit(bus, unit);
-            return;
-        }
-        m->player = pid;
-        log_msg("media: displaying %s (pid %d)", m->cached, (int)pid);
+        media_start(m, bus, unit, true);
     }
     if (m->player > 0 && waitpid(m->player, &status, WNOHANG) == m->player) {
         log_msg("media: player exited (status %d), restoring %s", status, unit);
@@ -1045,11 +1130,18 @@ int main(int argc, char **argv) {
                         } else {
                             log_msg("poweroff already in progress, ignoring");
                         }
-                    } else if (!strncmp(payload, "media ", 6)) {
-                        media_request(&media, strip(payload + 6));
-                    } else if (strcmp(payload, "media-cancel") == 0) {
+                    } else if (!strncmp(payload, "media:play ", 11)) {
+                        media_request(&media, bus, current_unit, strip(payload + 11));
+                    } else if (strcmp(payload, "media:stop") == 0) {
                         bool playing = media.player > 0;
                         media_cancel(&media, bus, current_unit, playing);
+                    } else if (strcmp(payload, "media:clear") == 0) {
+                        kill_child(&media.fetch);
+                        if (media.staged[0]) unlink(media.staged);
+                        media.staged[0] = '\0';
+                        media.next[0] = '\0';
+                        media_clear_cache(MEDIA_DIR, media.player > 0 ? media.cached : NULL);
+                        log_msg("media: cache cleared");
                     } else {
                         log_msg("unknown command: %s", payload);
                     }
@@ -1065,7 +1157,7 @@ int main(int argc, char **argv) {
                                 char desired[512];
                                 unit_name(new_app, desired, sizeof(desired));
                                 if (strcmp(desired, current_unit)) {
-                                    log_msg("media: will restore %s on cancel", desired);
+                                    log_msg("media: will restore %s on stop", desired);
                                     snprintf(current_unit, sizeof(current_unit), "%s", desired);
                                     cache_write(new_app);
                                 }

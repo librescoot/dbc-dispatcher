@@ -30,5 +30,43 @@ int main(void) {
     assert(copy_media(source, target) == -1);
     unlink(source);
     unlink(target);
+
+    char directory[] = "/tmp/dbc-media-cache-XXXXXX";
+    assert(mkdtemp(directory));
+    char paths[10][PATH_MAX];
+    for (int i = 0; i < 10; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/%016x.mp4", directory, i);
+        fd = open(paths[i], O_CREAT | O_EXCL | O_WRONLY, 0600);
+        assert(fd >= 0 && write(fd, "x", 1) == 1);
+        close(fd);
+        struct timespec times[] = {{100 + i, 0}, {100 + i, 0}};
+        assert(utimensat(AT_FDCWD, paths[i], times, 0) == 0);
+    }
+    media_prune(directory, paths[9]);
+    assert(access(paths[0], F_OK) != 0 && access(paths[1], F_OK) != 0);
+    for (int i = 2; i < 10; i++) assert(access(paths[i], F_OK) == 0);
+    media_clear_cache(directory, paths[9]);
+    for (int i = 0; i < 9; i++) assert(access(paths[i], F_OK) != 0);
+    assert(access(paths[9], F_OK) == 0);
+    char partial[PATH_MAX];
+    snprintf(partial, sizeof(partial), "%s/incoming.part", directory);
+    fd = open(partial, O_CREAT | O_WRONLY, 0600);
+    assert(fd >= 0);
+    close(fd);
+    media_clear_cache(directory, NULL);
+    assert(access(paths[9], F_OK) != 0 && access(partial, F_OK) != 0);
+
+    for (int i = 0; i < 3; i++) {
+        fd = open(paths[i], O_CREAT | O_EXCL | O_WRONLY, 0600);
+        assert(fd >= 0 && ftruncate(fd, 90 * 1024 * 1024) == 0);
+        close(fd);
+        struct timespec times[] = {{100 + i, 0}, {100 + i, 0}};
+        assert(utimensat(AT_FDCWD, paths[i], times, 0) == 0);
+    }
+    media_prune(directory, paths[2]);
+    assert(access(paths[0], F_OK) != 0);
+    assert(access(paths[1], F_OK) == 0 && access(paths[2], F_OK) == 0);
+    media_clear_cache(directory, NULL);
+    assert(rmdir(directory) == 0);
     return 0;
 }
