@@ -21,7 +21,7 @@ CROSS_LDFLAGS := $(shell $(CROSS_PKG_CONFIG_ENV) $(PKG_CONFIG) --libs libsystemd
 HOST_CFLAGS := $(CFLAGS) $(shell $(PKG_CONFIG) --cflags libsystemd hiredis 2>/dev/null)
 HOST_LDFLAGS := $(shell $(PKG_CONFIG) --libs libsystemd hiredis 2>/dev/null)
 
-.PHONY: build build-host build-arm dist clean
+.PHONY: build build-host build-arm dist test clean
 
 build:
 	mkdir -p $(BUILD_DIR)
@@ -35,6 +35,10 @@ build-host:
 
 dist: build
 	$(CROSS_STRIP) $(BUILD_DIR)/$(BINARY_NAME)
+
+test:
+	$(HOST_CC) $(HOST_CFLAGS) -o /tmp/dbc-dispatcher-media-test tests/media_test.c $(HOST_LDFLAGS)
+	/tmp/dbc-dispatcher-media-test
 
 clean:
 	rm -rf $(BUILD_DIR)

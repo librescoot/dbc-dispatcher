@@ -2,6 +2,8 @@
 #include <errno.h>
 #include <hiredis/hiredis.h>
 #include <poll.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -11,6 +13,8 @@
 #include <strings.h>
 #include <sys/signalfd.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
+#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <systemd/sd-bus.h>
 #include <time.h>
@@ -34,6 +38,9 @@
 #define STOP_TIMEOUT_US   5000000
 #define CACHE_DIR         "/var/lib/dbc-dispatcher"
 #define CACHE_FILE        CACHE_DIR "/last-app"
+#define MEDIA_DIR         "/data/dbc-dispatcher"
+#define MEDIA_LIMIT       (100 * 1024 * 1024)
+#define MEDIA_URL_MAX     2048
 
 /* The boot logo, animation and startup sound are chosen by U-Boot from its own
  * environment, which only something running on the DBC can write. A request
@@ -172,7 +179,7 @@ static int start_unit(sd_bus *bus, const char *unit) {
     return 0;
 }
 
-static void stop_unit(sd_bus *bus, const char *unit) {
+static int stop_unit(sd_bus *bus, const char *unit) {
     sd_bus_error error = SD_BUS_ERROR_NULL;
     sd_bus_message *reply = NULL;
     int r;
@@ -186,7 +193,7 @@ static void stop_unit(sd_bus *bus, const char *unit) {
     if (r < 0) {
         log_msg("stop %s: %s", unit, error.message ? error.message : strerror(-r));
         sd_bus_error_free(&error);
-        return;
+        return r;
     }
 
     const char *job_path = NULL;
@@ -195,7 +202,7 @@ static void stop_unit(sd_bus *bus, const char *unit) {
         log_msg("stop %s: failed to read job path: %s", unit, strerror(-r));
         sd_bus_message_unref(reply);
         sd_bus_error_free(&error);
-        return;
+        return r;
     }
 
     char job_path_copy[256];
@@ -208,6 +215,7 @@ static void stop_unit(sd_bus *bus, const char *unit) {
         log_msg("stopped %s", unit);
     else
         log_msg("stop %s: timed out or failed", unit);
+    return r;
 }
 
 /* Returns 0 on success (buf holds the configured app, or DEFAULT_APP when the
@@ -297,7 +305,8 @@ static void switch_to(sd_bus *bus, const char *new_app, char *current_unit,
         return;
 
     log_msg("switching %s -> %s", current_unit, new_unit);
-    stop_unit(bus, current_unit);
+    if (stop_unit(bus, current_unit) != 0)
+        return;
     if (start_unit(bus, new_unit) != 0) {
         log_msg("failed to start %s, reverting to %s", new_unit, current_unit);
         if (start_unit(bus, current_unit) != 0)
@@ -306,6 +315,216 @@ static void switch_to(sd_bus *bus, const char *new_app, char *current_unit,
     }
     snprintf(current_unit, unitsz, "%s", new_unit);
     cache_write(new_app);
+}
+
+/* --- temporary mock-up display ------------------------------------------ */
+
+typedef struct {
+    pid_t fetch;
+    pid_t player;
+    char staged[PATH_MAX];
+    char cached[PATH_MAX];
+    char next[PATH_MAX];
+    bool video;
+} Media;
+
+static const char *media_ext(const char *source) {
+    const char *end = source + strcspn(source, "?#");
+    const char *dot = NULL;
+    for (const char *p = source; p < end; p++) {
+        if (*p == '/') dot = NULL;
+        else if (*p == '.') dot = p;
+    }
+    if (!dot) return NULL;
+    if (end - dot == 4 && !strncasecmp(dot, ".mp4", 4)) return "mp4";
+    if (end - dot == 4 && !strncasecmp(dot, ".jpg", 4)) return "jpg";
+    if (end - dot == 5 && !strncasecmp(dot, ".jpeg", 5)) return "jpg";
+    if (end - dot == 4 && !strncasecmp(dot, ".png", 4)) return "png";
+    return NULL;
+}
+
+static void kill_child(pid_t *pid) {
+    if (*pid <= 0) return;
+    kill(*pid, SIGTERM);
+    for (int i = 0; i < 20; i++) {
+        if (waitpid(*pid, NULL, WNOHANG) == *pid) {
+            *pid = 0;
+            return;
+        }
+        usleep(50000);
+    }
+    kill(*pid, SIGKILL);
+    waitpid(*pid, NULL, 0);
+    *pid = 0;
+}
+
+static void child_signals(void) {
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigprocmask(SIG_SETMASK, &mask, NULL);
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+}
+
+static int copy_media(const char *source, const char *target) {
+    int in = open(source, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+    if (in < 0) return -1;
+    struct stat st;
+    if (fstat(in, &st) || !S_ISREG(st.st_mode) || st.st_size <= 0 || st.st_size > MEDIA_LIMIT) {
+        close(in);
+        return -1;
+    }
+    int out = open(target, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (out < 0) { close(in); return -1; }
+    char buf[65536];
+    ssize_t n;
+    int ok = 0;
+    while ((n = read(in, buf, sizeof(buf))) > 0) {
+        char *p = buf;
+        while (n > 0) {
+            ssize_t written = write(out, p, n);
+            if (written <= 0) { ok = -1; break; }
+            n -= written;
+            p += written;
+        }
+        if (ok) break;
+    }
+    if (n < 0 || fsync(out) != 0) ok = -1;
+    close(out);
+    close(in);
+    return ok;
+}
+
+static void media_clean_cache(void) {
+    unlink(MEDIA_DIR "/incoming.part");
+    unlink(MEDIA_DIR "/media.mp4");
+    unlink(MEDIA_DIR "/media.jpg");
+    unlink(MEDIA_DIR "/media.png");
+}
+
+static void media_cancel(Media *m, sd_bus *bus, const char *unit, bool restore) {
+    kill_child(&m->fetch);
+    if (m->staged[0]) unlink(m->staged);
+    m->staged[0] = '\0';
+    m->next[0] = '\0';
+    kill_child(&m->player);
+    if (m->cached[0]) unlink(m->cached);
+    m->cached[0] = '\0';
+    media_clean_cache();
+    if (restore && start_unit(bus, unit) != 0)
+        log_msg("media: failed to restore %s", unit);
+}
+
+static void media_request(Media *m, const char *source) {
+    size_t length = strlen(source);
+    if (!length || length >= MEDIA_URL_MAX || strchr(source, '\n') || strchr(source, '\r')) {
+        log_msg("media: invalid source length or characters");
+        return;
+    }
+    bool remote = !strncmp(source, "http://", 7) || !strncmp(source, "https://", 8);
+    const char *ext = media_ext(source);
+    if ((!remote && source[0] != '/') || !ext) {
+        log_msg("media: expected absolute local path or HTTP(S) URL ending in mp4, jpg, jpeg or png");
+        return;
+    }
+    if (mkdir(MEDIA_DIR, 0755) != 0 && errno != EEXIST) {
+        log_msg("media: mkdir: %s", strerror(errno));
+        return;
+    }
+    if (m->player <= 0 && m->fetch <= 0) media_clean_cache();
+    kill_child(&m->fetch);
+    if (m->staged[0]) unlink(m->staged);
+    snprintf(m->staged, sizeof(m->staged), MEDIA_DIR "/incoming.part");
+    snprintf(m->next, sizeof(m->next), MEDIA_DIR "/media.%s", ext);
+    m->video = strcmp(ext, "mp4") == 0;
+    pid_t pid = fork();
+    if (pid < 0) {
+        log_msg("media: fork: %s", strerror(errno));
+        m->staged[0] = '\0';
+        return;
+    }
+    if (pid == 0) {
+        child_signals();
+        if (getppid() == 1) _exit(1);
+        struct rlimit limit = {MEDIA_LIMIT, MEDIA_LIMIT};
+        setrlimit(RLIMIT_FSIZE, &limit);
+        if (!remote) _exit(copy_media(source, m->staged) == 0 ? 0 : 1);
+        execlp("curl", "curl", "--fail", "--silent", "--show-error", "--location",
+               "--max-redirs", "3", "--max-time", "120", "--max-filesize", "104857600",
+               "--proto", "=http,https", "--proto-redir", "=http,https",
+               "--output", m->staged, "--", source, (char *)NULL);
+        _exit(127);
+    }
+    m->fetch = pid;
+    log_msg("media: caching %s", source);
+}
+
+static void media_poll(Media *m, sd_bus *bus, const char *unit) {
+    int status;
+    if (m->fetch > 0 && waitpid(m->fetch, &status, WNOHANG) == m->fetch) {
+        m->fetch = 0;
+        struct stat st;
+        if (!WIFEXITED(status) || WEXITSTATUS(status) || stat(m->staged, &st) ||
+            !S_ISREG(st.st_mode) || st.st_size <= 0 || st.st_size > MEDIA_LIMIT) {
+            log_msg("media: download/copy failed; leaving display unchanged");
+            unlink(m->staged);
+            m->staged[0] = '\0';
+            return;
+        }
+        bool had_player = m->player > 0;
+        kill_child(&m->player);
+        if (rename(m->staged, m->next) != 0) {
+            log_msg("media: cache rename: %s", strerror(errno));
+            unlink(m->staged);
+            m->staged[0] = '\0';
+            if (had_player) {
+                if (m->cached[0]) unlink(m->cached);
+                m->cached[0] = '\0';
+                start_unit(bus, unit);
+            }
+            return;
+        }
+        m->staged[0] = '\0';
+        if (m->cached[0] && strcmp(m->cached, m->next)) unlink(m->cached);
+        snprintf(m->cached, sizeof(m->cached), "%s", m->next);
+        if (!had_player && stop_unit(bus, unit) != 0) {
+            log_msg("media: could not stop %s", unit);
+            unlink(m->cached);
+            m->cached[0] = '\0';
+            return;
+        }
+        pid_t pid = fork();
+        if (pid == 0) {
+            child_signals();
+            if (getppid() == 1) _exit(1);
+            if (m->video)
+                execlp("ffmpeg", "ffmpeg", "-hide_banner", "-loglevel", "warning",
+                       "-nostdin", "-re", "-stream_loop", "-1", "-i", m->cached,
+                       "-an", "-vf", "scale=480:480:force_original_aspect_ratio=decrease,"
+                       "pad=480:480:(ow-iw)/2:(oh-ih)/2", "-pix_fmt", "bgra",
+                       "-f", "fbdev", "/dev/fb0", (char *)NULL);
+            else
+                execlp("ffmpeg", "ffmpeg", "-hide_banner", "-loglevel", "warning",
+                       "-nostdin", "-loop", "1", "-framerate", "1", "-re",
+                       "-i", m->cached, "-vf", "scale=480:480:force_original_aspect_ratio=decrease,"
+                       "pad=480:480:(ow-iw)/2:(oh-ih)/2", "-pix_fmt", "bgra",
+                       "-f", "fbdev", "/dev/fb0", (char *)NULL);
+            _exit(127);
+        }
+        if (pid < 0) {
+            log_msg("media: player fork: %s", strerror(errno));
+            unlink(m->cached);
+            m->cached[0] = '\0';
+            start_unit(bus, unit);
+            return;
+        }
+        m->player = pid;
+        log_msg("media: displaying %s (pid %d)", m->cached, (int)pid);
+    }
+    if (m->player > 0 && waitpid(m->player, &status, WNOHANG) == m->player) {
+        log_msg("media: player exited (status %d), restoring %s", status, unit);
+        m->player = 0;
+        media_cancel(m, bus, unit, true);
+    }
 }
 
 /* --- journal upload ------------------------------------------------------ */
@@ -683,6 +902,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    Media media = {0};
     redisContext *rctx = NULL;
     redisContext *sub_ctx = NULL;
     bool synced = false;
@@ -703,7 +923,8 @@ int main(int argc, char **argv) {
             nfds++;
         }
 
-        int ret = poll(fds, nfds, synced ? -1 : 1000);
+        int ret = poll(fds, nfds, (media.fetch > 0 || media.player > 0) ? 250 :
+                       (synced ? -1 : 1000));
         if (ret < 0) {
             if (errno == EINTR)
                 continue;
@@ -711,9 +932,11 @@ int main(int argc, char **argv) {
             break;
         }
 
+        media_poll(&media, bus, current_unit);
+
         /* Not yet synced with Redis: (re)establish and reconcile. Subscribe
          * BEFORE reading the setting so a change can't slip between the two. */
-        if (ret == 0) {
+        if (ret == 0 && !synced) {
             struct timeval tv = {0, 500000};
             if (!sub_ctx) {
                 sub_ctx = redisConnectWithTimeout(REDIS_HOST, REDIS_PORT, tv);
@@ -742,7 +965,16 @@ int main(int argc, char **argv) {
             if (rctx) {
                 char cfg_app[256];
                 if (read_setting(rctx, cfg_app, sizeof(cfg_app)) == 0) {
-                    switch_to(bus, cfg_app, current_unit, sizeof(current_unit));
+                    if (media.player > 0) {
+                        char desired[512];
+                        unit_name(cfg_app, desired, sizeof(desired));
+                        if (strcmp(desired, current_unit)) {
+                            snprintf(current_unit, sizeof(current_unit), "%s", desired);
+                            cache_write(cfg_app);
+                        }
+                    } else {
+                        switch_to(bus, cfg_app, current_unit, sizeof(current_unit));
+                    }
                     /* The DBC's U-Boot environment is only writable from here,
                      * so this is where a theme requested while the scooter was
                      * asleep gets applied. */
@@ -761,8 +993,10 @@ int main(int argc, char **argv) {
         if (fds[0].revents & POLLIN) {
             struct signalfd_siginfo si;
             if (read(sfd, &si, sizeof(si)) == sizeof(si)) {
-                log_msg("shutting down, stopping %s", current_unit);
-                stop_unit(bus, current_unit);
+                log_msg("shutting down, stopping display");
+                bool playing = media.player > 0;
+                media_cancel(&media, bus, current_unit, false);
+                if (!playing) stop_unit(bus, current_unit);
                 break;
             }
         }
@@ -811,6 +1045,11 @@ int main(int argc, char **argv) {
                         } else {
                             log_msg("poweroff already in progress, ignoring");
                         }
+                    } else if (!strncmp(payload, "media ", 6)) {
+                        media_request(&media, strip(payload + 6));
+                    } else if (strcmp(payload, "media-cancel") == 0) {
+                        bool playing = media.player > 0;
+                        media_cancel(&media, bus, current_unit, playing);
                     } else {
                         log_msg("unknown command: %s", payload);
                     }
@@ -822,8 +1061,18 @@ int main(int argc, char **argv) {
                         if (read_setting(rctx, new_app, sizeof(new_app)) == 0) {
                             log_msg("setting %s changed, new value: %s",
                                     REDIS_FIELD, new_app);
-                            switch_to(bus, new_app, current_unit,
-                                      sizeof(current_unit));
+                            if (media.player > 0) {
+                                char desired[512];
+                                unit_name(new_app, desired, sizeof(desired));
+                                if (strcmp(desired, current_unit)) {
+                                    log_msg("media: will restore %s on cancel", desired);
+                                    snprintf(current_unit, sizeof(current_unit), "%s", desired);
+                                    cache_write(new_app);
+                                }
+                            } else {
+                                switch_to(bus, new_app, current_unit,
+                                          sizeof(current_unit));
+                            }
                         } else {
                             /* Reconnect and reconcile rather than dropping this setting change. */
                             if (rctx) {

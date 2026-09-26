@@ -23,6 +23,7 @@ apply later changes.
   `systemd-journal-upload` when set, stops and disables it when unset — the
   same settings-service behaviour the MDB applies to its own copy.
 - Responds to a dashboard power-off command and handles orderly termination.
+- Temporarily displays a local image or looping video, or downloads one over HTTP(S) before switching the display. Canceling restores the configured application.
 
 ## Operation and interfaces
 
@@ -35,6 +36,8 @@ default is `scootui-qt`. It subscribes to these pub/sub channels:
 | `settings` | `dashboard.app` | Re-read the setting and switch the managed unit |
 | `settings` | `scooter.logserver` | Re-read the setting and (re)apply journal-upload |
 | `dbc:command` | `poweroff` | Invoke `poweroff` |
+| `dbc:command` | `media <source>` | Cache and display an MP4, JPEG or PNG from an absolute DBC path or HTTP(S) URL |
+| `dbc:command` | `media-cancel` | Stop media playback and restore the configured dashboard |
 
 The active selection is persisted in `/var/lib/dbc-dispatcher/last-app` after a
 successful switch. At startup, that cache is used before a datastore connection
@@ -63,14 +66,28 @@ redis-cli PUBLISH settings dashboard.app
 The configured value names a systemd unit. Only select units that are installed
 and appropriate for the DBC.
 
+## Temporary media display
+
+The command source must end in `.mp4`, `.jpg`, `.jpeg`, or `.png` (a URL query string is allowed). The DBC must have `curl` and `ffmpeg`, and its framebuffer must be `/dev/fb0` with a 480×480 display accepting `bgra` pixels. For example, with a file on the MDB's data-server:
+
+```sh
+redis-cli PUBLISH dbc:command 'media http://192.168.7.1:8080/mockup.mp4'
+redis-cli PUBLISH dbc:command 'media-cancel'
+```
+
+For a file already on the DBC, use `media /data/mockup.png`. Downloads and local copies go to `/data/dbc-dispatcher/` (100 MiB maximum, 120-second HTTP timeout). The current display stays up until the copy succeeds; failure leaves it unchanged. MP4 playback loops and images remain on screen. A new `media` request replaces the pending download or current playback after the new copy succeeds. `dashboard.app` changes during playback take effect on cancel. Playback is transient: reboot starts the configured dashboard, not the media. A canceled request or dispatcher termination removes its cache; stale cache entries are cleared before the next request.
+
+`journalctl -u dbc-dispatcher` reports fetch and playback failures. `media-cancel` is safe to send even when no media is active.
+
 ## Build and test
 
-The project has a single C source file and no automated test target. Build with:
+The project has a single C source file. Build and test with:
 
 ```sh
 make build-host   # host binary in bin/dbc-dispatcher
 make build        # ARMv7 cross-build in bin/dbc-dispatcher
 make dist         # ARMv7 build, then strip it
+make test         # Host media validation tests
 ```
 
 Host builds require `gcc`, `pkg-config`, and development packages for
@@ -83,7 +100,8 @@ Host builds require `gcc`, `pkg-config`, and development packages for
 The Yocto recipe installs `/usr/bin/dbc-dispatcher` and enables
 `dbc-dispatcher.service`. At runtime it requires systemd (including
 `/run/systemd/private`), a Redis-compatible server at the compiled endpoint,
-and the display application units it may manage. The service runs as root,
+and the display application units it may manage. Temporary media also requires
+`curl`, `ffmpeg`, `/data`, and the DBC framebuffer. The service runs as root,
 restarts after three seconds on failure, and logs to the system journal.
 
 ## Operational notes
