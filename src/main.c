@@ -628,6 +628,12 @@ static int run_cmd(char *const argv[]) {
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
+static int stop_log_upload(void) {
+    if (run_cmd((char *[]){"systemctl", "is-enabled", "--quiet", JOURNAL_UNIT, NULL}) == 0)
+        return run_cmd((char *[]){"systemctl", "disable", "--now", JOURNAL_UNIT, NULL});
+    return run_cmd((char *[]){"systemctl", "stop", JOURNAL_UNIT, NULL});
+}
+
 static int read_logserver(redisContext *ctx, char *buf, size_t bufsz) {
     if (!ctx)
         return -1;
@@ -706,7 +712,7 @@ static int apply_logserver(redisContext *ctx) {
     }
 
     if (!url[0]) {
-        if (run_cmd((char *[]){"systemctl", "disable", "--now", JOURNAL_UNIT, NULL}) == 0)
+        if (stop_log_upload() == 0)
             log_msg("log server unset, journal-upload stopped and disabled");
         else
             log_msg("failed to stop/disable %s", JOURNAL_UNIT);

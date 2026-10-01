@@ -39,6 +39,8 @@ dist: build
 test:
 	$(HOST_CC) $(HOST_CFLAGS) -o /tmp/dbc-dispatcher-media-test tests/media_test.c $(HOST_LDFLAGS)
 	/tmp/dbc-dispatcher-media-test
+	$(HOST_CC) $(HOST_CFLAGS) -o /tmp/dbc-dispatcher-logserver-test tests/logserver_test.c $(HOST_LDFLAGS)
+	/tmp/dbc-dispatcher-logserver-test
 
 clean:
 	rm -rf $(BUILD_DIR)
