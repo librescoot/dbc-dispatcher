@@ -41,6 +41,8 @@ test:
 	/tmp/dbc-dispatcher-media-test
 	$(HOST_CC) $(HOST_CFLAGS) -o /tmp/dbc-dispatcher-logserver-test tests/logserver_test.c $(HOST_LDFLAGS)
 	/tmp/dbc-dispatcher-logserver-test
+	$(HOST_CC) $(HOST_CFLAGS) -o /tmp/dbc-dispatcher-boot-test tests/boot_test.c $(HOST_LDFLAGS)
+	/tmp/dbc-dispatcher-boot-test
 
 clean:
 	rm -rf $(BUILD_DIR)

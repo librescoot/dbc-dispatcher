@@ -16,6 +16,7 @@ apply later changes.
 - Starts the last successfully selected application before the datastore is
   reachable, improving display startup after boot.
 - Reconciles the selected application when datastore connectivity returns.
+- Applies boot theme and sound requests and publishes the DBC's boot state. If the U-Boot environment is not yet readable, it retries without delaying the display.
 - Watches for live application changes and rolls back to the previous unit if
   the replacement does not start.
 - Applies `settings[scooter.logserver]`: rewrites
@@ -91,11 +92,11 @@ The project has a single C source file. Build and test with:
 make build-host   # host binary in bin/dbc-dispatcher
 make build        # ARMv7 cross-build in bin/dbc-dispatcher
 make dist         # ARMv7 build, then strip it
-make test         # Host media validation tests
+make test         # Host media, log-server and boot-state tests
 ```
 
 Host builds require `gcc`, `pkg-config`, and development packages for
-`libsystemd` and `hiredis`. The ARM build additionally requires
+`libsystemd` and `hiredis`. Tests also require `redis-server`. The ARM build additionally requires
 `arm-linux-gnueabihf-gcc`, `arm-linux-gnueabihf-strip`, and ARM-target
 `pkg-config` metadata for those libraries.
 
